@@ -45,22 +45,13 @@ Set the default options for FastMM here.
 {.$define NeverUninstall}
 
 {Set this option when you use runtime packages in this application or library.
- This will automatically set the "AssumeMultiThreaded" option. Note that you
- have to ensure that FastMM is finalized after all live pointers have been
- freed - failure to do so will result in a large leak report followed by a lot
- of A/Vs. (See the FAQ for more detail.) You may have to combine this option
- with the NeverUninstall option.}
+ Note that you have to ensure that FastMM is finalized after all live pointers
+ have been freed - failure to do so will result in a large leak report followed
+ by a lot of A/Vs. (See the FAQ for more detail.) You may have to combine this
+ option with the NeverUninstall option.}
 {.$define UseRuntimePackages}
 
 {-----------------------Concurrency Management Options------------------------}
-
-{Enable to always assume that the application is multithreaded. Enabling this
- option will cause a significant performance hit with single threaded
- applications. Enable if you are using multi-threaded third party tools that do
- not properly set the IsMultiThread variable. Also set this option if you are
- going to share this memory manager between a single threaded application and a
- multi-threaded DLL.}
-{.$define AssumeMultiThreaded}
 
 {Enable this option to not call Sleep when a thread contention occurs. This
  option will improve performance if the ratio of the number of active threads
@@ -129,7 +120,7 @@ Set the default options for FastMM here.
    stack for valid return addresses. Note that this is significantly slower
    than using the stack frame tracing method, but is usually more complete. Has
    no effect unless FullDebugMode is enabled}
-  {$define RawStackTraces}
+  {.$define RawStackTraces}
 
   {Set this option to check for user code that uses an interface of a freed
    object. Note that this will disable the checking of blocks modified after
@@ -362,7 +353,6 @@ Set the default options for FastMM here.
 
 {Do not change anything below this line}
 {$ifdef borlndmmdll}
-  {$define AssumeMultiThreaded}
   {$undef HideExpectedLeaksRegisteredByPointer}
   {$undef RequireDebuggerPresenceForLeakReporting}
   {$undef RequireDebugInfoForLeakReporting}
