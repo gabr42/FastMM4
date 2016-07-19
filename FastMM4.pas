@@ -853,6 +853,8 @@ Change log:
   - Release stacks are compiled in by default.
   - Removed assembler versions of code in all places that support release stacks.
     I don't want to support combined pascal+assembler code.
+  - Removed support for AssumeMultiThreaded define. Operation is always assumed
+    to be multithreaded.
   [planned: support for multiple per-NUMA-node allocators]
 *)
 
@@ -1062,10 +1064,6 @@ interface
   {$ifdef ASMVersion}
     {$define Use32BitAsm}
   {$endif}
-{$endif}
-
-{$ifdef UseRuntimePackages}
-  {$define AssumeMultiThreaded}
 {$endif}
 
 {$ifdef BCB6OrDelphi6AndUp}
@@ -3288,7 +3286,7 @@ var
 
 {$endif}
 
-{$ifdef UseReleaseStack }
+{$ifdef UseReleaseStack}
 function GetStackSlot: DWORD;
 begin
 // http://burtleburtle.net/bob/hash/integer.html
@@ -3700,25 +3698,20 @@ var
   LInd: Cardinal;
 begin
   {Lock the medium blocks}
-{$ifndef AssumeMultiThreaded}
-  if IsMultiThread then
-{$endif}
+  for LInd := 0 to NumSmallBlockTypes - 1 do
   begin
-    for LInd := 0 to NumSmallBlockTypes - 1 do
+    while LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) <> 0 do
     begin
-      while LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) <> 0 do
-      begin
 {$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-        SwitchToThread;
-  {$endif}
-{$else}
-        Sleep(InitialSleepTime);
-        if LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) = 0 then
-          Break;
-        Sleep(AdditionalSleepTime);
+{$ifdef UseSwitchToThread}
+      SwitchToThread;
 {$endif}
-      end;
+{$else}
+      Sleep(InitialSleepTime);
+      if LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) = 0 then
+        Break;
+      Sleep(AdditionalSleepTime);
+{$endif}
     end;
   end;
 end;
@@ -3797,38 +3790,33 @@ begin
 {$ifdef LogLockContention}
   ADidSleep := False;
 {$endif}
-{$ifndef AssumeMultiThreaded}
-  if IsMultiThread then
-{$endif}
+  while LockCmpxchg(0, 1, @MediumBlocksLocked) <> 0 do
   begin
-    while LockCmpxchg(0, 1, @MediumBlocksLocked) <> 0 do
-    begin
 {$ifdef UseReleaseStack}
-      if Assigned(APointer) then
-      begin
-         LPReleaseStack := @MediumReleaseStack[GetStackSlot];
-         if (not LPReleaseStack^.IsFull) and LPReleaseStack.Push(APointer) then
-         begin
-           APointer := nil;
-           APDelayRelease^ := True;
-           Exit;
-         end;
-      end;
+    if Assigned(APointer) then
+    begin
+       LPReleaseStack := @MediumReleaseStack[GetStackSlot];
+       if (not LPReleaseStack^.IsFull) and LPReleaseStack.Push(APointer) then
+       begin
+         APointer := nil;
+         APDelayRelease^ := True;
+         Exit;
+       end;
+    end;
 {$endif}
 {$ifdef LogLockContention}
-      ADidSleep := True;
+    ADidSleep := True;
 {$endif}
 {$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-      SwitchToThread;
-  {$endif}
-{$else}
-      Sleep(InitialSleepTime);
-      if LockCmpxchg(0, 1, @MediumBlocksLocked) = 0 then
-        Break;
-      Sleep(AdditionalSleepTime);
+{$ifdef UseSwitchToThread}
+    SwitchToThread;
 {$endif}
-    end;
+{$else}
+    Sleep(InitialSleepTime);
+    if LockCmpxchg(0, 1, @MediumBlocksLocked) = 0 then
+      Break;
+    Sleep(AdditionalSleepTime);
+{$endif}
   end;
 {$ifdef UseReleaseStack}
   if Assigned(APDelayRelease) then
@@ -4255,6 +4243,7 @@ begin
   {Bin the current sequential feed remainder}
   BinMediumSequentialFeedRemainder;
   {Allocate a new sequential feed block pool}
+  // ***NUMA***
   LNewPool := VirtualAlloc(nil, MediumBlockPoolSize,
     MEM_COMMIT{$ifdef AlwaysAllocateTopDown} or MEM_TOP_DOWN{$endif}, PAGE_READWRITE);
   if LNewPool <> nil then
@@ -4297,38 +4286,33 @@ begin
 {$ifdef LogLockContention}
   ADidSleep := False;
 {$endif}
-{$ifndef AssumeMultiThreaded}
-  if IsMultiThread then
-{$endif}
+  while LockCmpxchg(0, 1, @LargeBlocksLocked) <> 0 do
   begin
-    while LockCmpxchg(0, 1, @LargeBlocksLocked) <> 0 do
-    begin
 {$ifdef UseReleaseStack}
-      if Assigned(APointer) then
-      begin
-         LPReleaseStack := @LargeReleaseStack[GetStackSlot];
-         if (not LPReleaseStack^.IsFull) and LPReleaseStack.Push(APointer) then
-         begin
-           APointer := nil;
-           APDelayRelease^ := True;
-           Exit;
-         end;
-      end;
+    if Assigned(APointer) then
+    begin
+       LPReleaseStack := @LargeReleaseStack[GetStackSlot];
+       if (not LPReleaseStack^.IsFull) and LPReleaseStack.Push(APointer) then
+       begin
+         APointer := nil;
+         APDelayRelease^ := True;
+         Exit;
+       end;
+    end;
 {$endif}
 {$ifdef LogLockContention}
-      ADidSleep := True;
+    ADidSleep := True;
 {$endif}
 {$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-      SwitchToThread;
-  {$endif}
-{$else}
-      Sleep(InitialSleepTime);
-      if LockCmpxchg(0, 1, @LargeBlocksLocked) = 0 then
-        Break;
-      Sleep(AdditionalSleepTime);
+{$ifdef UseSwitchToThread}
+    SwitchToThread;
 {$endif}
-    end;
+{$else}
+    Sleep(InitialSleepTime);
+    if LockCmpxchg(0, 1, @LargeBlocksLocked) = 0 then
+      Break;
+    Sleep(AdditionalSleepTime);
+{$endif}
   end;
 {$ifdef UseReleaseStack}
   if Assigned(APDelayRelease) then
@@ -4352,6 +4336,7 @@ begin
   LLargeUsedBlockSize := (ASize + LargeBlockHeaderSize + LargeBlockGranularity - 1 + BlockHeaderSize)
     and -LargeBlockGranularity;
   {Get the Large block}
+  // ***NUMA***
   Result := VirtualAlloc(nil, LLargeUsedBlockSize, MEM_COMMIT or MEM_TOP_DOWN,
     PAGE_READWRITE);
   {Set the Large block fields}
@@ -4549,6 +4534,7 @@ begin
           LNewSegmentSize := LMemInfo.RegionSize;
         {Attempy to reserve the address range (which will fail if another
          thread has just reserved it) and commit it immediately afterwards.}
+        // ***NUMA***
         if (VirtualAlloc(LNextSegmentPointer, LNewSegmentSize, MEM_RESERVE, PAGE_READWRITE) <> nil)
           and (VirtualAlloc(LNextSegmentPointer, LNewSegmentSize, MEM_COMMIT, PAGE_READWRITE) <> nil) then
         begin
@@ -4671,42 +4657,37 @@ begin
       Exit;
 {$endif}
     {Lock the block type}
-{$ifndef AssumeMultiThreaded}
-    if IsMultiThread then
-{$endif}
+    while True do
     begin
-      while True do
-      begin
-        {Try to lock the small block type}
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {Try the next block type}
-        Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {Try up to two sizes past the requested size}
-        Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {All three sizes locked - given up and sleep}
-        Dec(PByte(LPSmallBlockType), 2 * SizeOf(TSmallBlockType));
+      {Try to lock the small block type}
+      if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+        Break;
+      {Try the next block type}
+      Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
+      if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+        Break;
+      {Try up to two sizes past the requested size}
+      Inc(PByte(LPSmallBlockType), SizeOf(TSmallBlockType));
+      if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+        Break;
+      {All three sizes locked - given up and sleep}
+      Dec(PByte(LPSmallBlockType), 2 * SizeOf(TSmallBlockType));
 {$ifdef LogLockContention}
-        ACollector := @LPSmallBlockType.BlockCollector;
+      ACollector := @LPSmallBlockType.BlockCollector;
 {$endif}
 {$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-        SwitchToThread;
-  {$endif}
-{$else}
-        {Both this block type and the next is in use: sleep}
-        Sleep(InitialSleepTime);
-        {Try the lock again}
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        {Sleep longer}
-        Sleep(AdditionalSleepTime);
+{$ifdef UseSwitchToThread}
+      SwitchToThread;
 {$endif}
-      end;
+{$else}
+      {Both this block type and the next is in use: sleep}
+      Sleep(InitialSleepTime);
+      {Try the lock again}
+      if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+        Break;
+      {Sleep longer}
+      Sleep(AdditionalSleepTime);
+{$endif}
     end;
     {Get the first pool with free blocks}
     LPSmallBlockPool := LPSmallBlockType.NextPartiallyFreePool;
@@ -5069,7 +5050,7 @@ begin
     else
     begin
       {Allocate a Large block}
-      if ASize > 0 then 
+      if ASize > 0 then
       begin
         Result := AllocateLargeBlock(ASize {$ifdef LogLockContention}, LDidSleep{$endif});
 {$ifdef LogLockContention}
@@ -5356,35 +5337,30 @@ begin
 {$ifdef LogLockContention}
     LDidSleep := False;
 {$endif}
-{$ifndef AssumeMultiThreaded}
-    if IsMultiThread then
-{$endif}
+    while (LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) <> 0) do
     begin
-      while (LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) <> 0) do
-      begin
 {$ifdef UseReleaseStack}
-        LPReleaseStack := @LPSmallBlockType.ReleaseStack[GetStackSlot];
-        if (not LPReleaseStack^.IsFull) and LPReleaseStack^.Push(APointer) then
-        begin
-          {Block will be released later.}
-          Result := 0;
-          Exit;
-        end;
+      LPReleaseStack := @LPSmallBlockType.ReleaseStack[GetStackSlot];
+      if (not LPReleaseStack^.IsFull) and LPReleaseStack^.Push(APointer) then
+      begin
+        {Block will be released later.}
+        Result := 0;
+        Exit;
+      end;
 {$endif}
 {$ifdef LogLockContention}
-        LDidSleep := True;
+      LDidSleep := True;
 {$endif}
 {$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-        SwitchToThread;
-  {$endif}
-{$else}
-        Sleep(InitialSleepTime);
-        if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
-          Break;
-        Sleep(AdditionalSleepTime);
+{$ifdef UseSwitchToThread}
+      SwitchToThread;
 {$endif}
-      end;
+{$else}
+      Sleep(InitialSleepTime);
+      if LockCmpxchg(0, 1, @LPSmallBlockType.BlockTypeLocked) = 0 then
+        Break;
+      Sleep(AdditionalSleepTime);
+{$endif}
     end;
 {$ifdef LogLockContention}
     if LDidSleep then
@@ -5732,54 +5708,36 @@ begin
           begin
             {The next block is free and there is enough space to grow this
              block in place.}
-{$ifndef AssumeMultiThreaded}
-            if IsMultiThread then
-            begin
-{$endif}
-              {Multi-threaded application - lock medium blocks and re-read the
-               information on the blocks.}
-               LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
+            {Multi-threaded application - lock medium blocks and re-read the
+             information on the blocks.}
+             LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
 {$ifdef LogLockContention}
-               if LDidSleep then
-                 LCollector := @MediumBlockCollector;
+             if LDidSleep then
+               LCollector := @MediumBlockCollector;
 {$endif}
-              {Re-read the info for this block}
-              LBlockFlags := PNativeUInt(PByte(APointer) - BlockHeaderSize)^ and ExtractMediumAndLargeFlagsMask;
-              {Re-read the info for the next block}
-              LNextBlockSizeAndFlags := PNativeUInt(PByte(LPNextBlock) - BlockHeaderSize)^;
-              {Recalculate the next block size}
-              LNextBlockSize := LNextBlockSizeAndFlags and DropMediumAndLargeFlagsMask;
-              {The available size including the next block}
-              LNewAvailableSize := LOldAvailableSize + LNextBlockSize;
-              {Is the next block still free and the size still sufficient?}
-              if (LNextBlockSizeAndFlags and IsFreeBlockFlag <> 0)
-                and (NativeUInt(ANewSize) <= LNewAvailableSize) then
-              begin
-                {Upsize the block in-place}
-                MediumBlockInPlaceUpsize;
-                {Unlock the medium blocks}
-                MediumBlocksLocked := False;
-                {Return the result}
-                Result := APointer;
-                {Done}
-                Exit;
-              end;
-              {Couldn't use the block: Unlock the medium blocks}
-              MediumBlocksLocked := False;
-{$ifndef AssumeMultiThreaded}
-            end
-            else
+            {Re-read the info for this block}
+            LBlockFlags := PNativeUInt(PByte(APointer) - BlockHeaderSize)^ and ExtractMediumAndLargeFlagsMask;
+            {Re-read the info for the next block}
+            LNextBlockSizeAndFlags := PNativeUInt(PByte(LPNextBlock) - BlockHeaderSize)^;
+            {Recalculate the next block size}
+            LNextBlockSize := LNextBlockSizeAndFlags and DropMediumAndLargeFlagsMask;
+            {The available size including the next block}
+            LNewAvailableSize := LOldAvailableSize + LNextBlockSize;
+            {Is the next block still free and the size still sufficient?}
+            if (LNextBlockSizeAndFlags and IsFreeBlockFlag <> 0)
+              and (NativeUInt(ANewSize) <= LNewAvailableSize) then
             begin
-              {Extract the block flags}
-              LBlockFlags := ExtractMediumAndLargeFlagsMask and LBlockHeader;
               {Upsize the block in-place}
               MediumBlockInPlaceUpsize;
+              {Unlock the medium blocks}
+              MediumBlocksLocked := False;
               {Return the result}
               Result := APointer;
               {Done}
               Exit;
             end;
-{$endif}
+            {Couldn't use the block: Unlock the medium blocks}
+            MediumBlocksLocked := False;
           end;
         end;
         {Couldn't upsize in place. Grab a new block and move the data across:
@@ -7820,25 +7778,21 @@ end;
 function LockExpectedMemoryLeaksList: Boolean;
 begin
   {Lock the expected leaks list}
-{$ifndef AssumeMultiThreaded}
-  if IsMultiThread then
-{$endif}
+  while LockCmpxchg(0, 1, @ExpectedMemoryLeaksListLocked) <> 0 do
   begin
-    while LockCmpxchg(0, 1, @ExpectedMemoryLeaksListLocked) <> 0 do
-    begin
 {$ifdef NeverSleepOnThreadContention}
-  {$ifdef UseSwitchToThread}
-      SwitchToThread;
-  {$endif}
-{$else}
-      Sleep(InitialSleepTime);
-      if LockCmpxchg(0, 1, @ExpectedMemoryLeaksListLocked) = 0 then
-        Break;
-      Sleep(AdditionalSleepTime);
+{$ifdef UseSwitchToThread}
+    SwitchToThread;
 {$endif}
-    end;
+{$else}
+    Sleep(InitialSleepTime);
+    if LockCmpxchg(0, 1, @ExpectedMemoryLeaksListLocked) = 0 then
+      Break;
+    Sleep(AdditionalSleepTime);
+{$endif}
   end;
   {Allocate the list if it does not exist}
+  // ***NUMA*** ? Maybe not, this is probably just used during the shutdown?
   if ExpectedMemoryLeaks = nil then
     ExpectedMemoryLeaks := VirtualAlloc(nil, ExpectedMemoryLeaksListSize, MEM_COMMIT, PAGE_READWRITE);
   {Done}
