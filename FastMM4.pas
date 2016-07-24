@@ -1859,6 +1859,7 @@ type
 {$endif}
   end;
 
+  // TODO 1 -oPrimoz Gabrijelcic : *** size info is incorrect
   {Small block pool (Size = 32 bytes for 32-bit, 48 bytes for 64-bit).}
   TSmallBlockPoolHeader = record
     {BlockType}
@@ -1878,10 +1879,13 @@ type
     FirstFreeBlock: Pointer;
     {The number of blocks allocated in this pool.}
     BlocksInUse: Cardinal;
-    {NUMA node. Defined even if NUMA support is disabled to provide padding.}
-    NumaNode: Integer;
     {The pool pointer and flags of the first block}
     FirstBlockPoolPointerAndFlags: NativeUInt;
+    {NUMA node}
+    NumaNode: Integer;
+{$ifndef 32Bit}
+    Padding: Integer;
+{$endif}
   end;
 
   TBlockHeader = packed record
@@ -1901,6 +1905,7 @@ type
 
   {------------------------Medium block structures------------------------}
 
+  // TODO 1 -oPrimoz Gabrijelcic : *** size info is incorrect
   {The medium block pool from which medium blocks are drawn. Size = 16 bytes
    for 32-bit and 32 bytes for 64-bit.}
   PMediumBlockPoolHeader = ^TMediumBlockPoolHeader;
@@ -1913,6 +1918,10 @@ type
     Reserved1: NativeUInt;
     {The block size and flags of the first medium block in the block pool}
     FirstMediumBlockSizeAndFlags: NativeUInt;
+    NumaNode: Integer;
+{$ifndef 32Bit}
+    Padding: Integer;
+{$endif}
   end;
 
   {Medium block layout:
@@ -1932,6 +1941,7 @@ type
 
   {-------------------------Large block structures------------------------}
 
+  // TODO 1 -oPrimoz Gabrijelcic : *** size info is incorrect
   {Large block header record (Size = 16 for 32-bit, 32 for 64-bit)}
   PLargeBlockHeader = ^TLargeBlockHeader;
   TLargeBlockHeader = record
@@ -1943,6 +1953,10 @@ type
     UserAllocatedSize: NativeUInt;
     {The size of this block plus the flags}
     BlockSizeAndFlags: NativeUInt;
+    NumaNode: Integer;
+{$ifndef 32Bit}
+    Padding: Integer;
+{$endif}
   end;
 
   {-------------------------Expected Memory Leak Structures--------------------}
@@ -4010,6 +4024,7 @@ begin
     MediumBlockPoolsCircularList[ANumaNode].NextMediumBlockPoolHeader := LNewPool;
     PMediumBlockPoolHeader(LNewPool).NextMediumBlockPoolHeader := LOldFirstMediumBlockPool;
     LOldFirstMediumBlockPool.PreviousMediumBlockPoolHeader := LNewPool;
+    PMediumBlockPoolHeader(LNewPool).NumaNode := ANumaNode;
     {Store the sequential feed pool trailer}
     PNativeUInt(PByte(LNewPool) + MediumBlockPoolSize - BlockHeaderSize)^ := IsMediumBlockFlag;
     {Get the number of bytes still available}
@@ -4087,6 +4102,7 @@ function AllocateLargeBlock(ASize: NativeUInt {$ifdef LogLockContention}; var AD
 var
   LLargeUsedBlockSize: NativeUInt;
   LOldFirstLargeBlock: PLargeBlockHeader;
+  LNumaNode: Integer;
 begin
   {Pad the block size to include the header and granularity. We also add a
    SizeOf(Pointer) overhead so a huge block size is a multiple of 16 bytes less
@@ -4096,8 +4112,9 @@ begin
     and -LargeBlockGranularity;
   {Get the Large block}
   // ***TEMPORARY***
+  LNumaNode := GetThreadNUMANode;
   Result := VirtualAllocExNuma($FFFFFFFF {GetCurrentProcess}, nil, LLargeUsedBlockSize,
-    MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE, GetThreadNUMANode);
+    MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE, LNumaNode);
 //  Result := VirtualAlloc(nil, LLargeUsedBlockSize, MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN,
 //    PAGE_READWRITE);
   {Set the Large block fields}
@@ -4113,6 +4130,7 @@ begin
     LargeBlocksCircularList.NextLargeBlockHeader := Result;
     PLargeBlockHeader(Result).NextLargeBlockHeader := LOldFirstLargeBlock;
     LOldFirstLargeBlock.PreviousLargeBlockHeader := Result;
+    PLargeBlockHeader(Result).NumaNode := LNumaNode;
     LargeBlocksLocked := False;
     {Add the size of the header}
     Inc(PByte(Result), LargeBlockHeaderSize);
@@ -4190,6 +4208,7 @@ begin
     if PLargeBlockHeader(APointer).BlockSizeAndFlags and LargeBlockIsSegmented = 0 then
     begin
   {$endif}
+      // TODO 1 -oPrimoz Gabrijelcic : *** this could be pushed out of the lock-protected code - maybe
       {Single segment large block: Try to free it}
       if VirtualFree(APointer, 0, MEM_RELEASE) then
         Result := 0
@@ -4205,6 +4224,7 @@ begin
       Result := 0;
       while True do
       begin
+        // TODO 1 -oPrimoz Gabrijelcic : *** this could be pushed out of the lock-protected code - maybe, at least partially
         {Get the size of the current segment}
         VirtualQuery(LCurrentSegment, LMemInfo, SizeOf(LMemInfo));
         {Free the segment}
@@ -4400,6 +4420,7 @@ var
 {$endif}
   LNumaNode: integer;
 begin
+OutputDebugStringA('Get');
 {$ifdef LogLockContention}
   ACollector := nil;
 {$endif}
@@ -5080,6 +5101,7 @@ var
   LPReleaseStack: ^TLFStack;
 {$endif}
 begin
+OutputDebugStringA('Free');
   {$ifdef fpc}
   if APointer = nil then
   begin
