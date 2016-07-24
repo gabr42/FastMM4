@@ -1137,6 +1137,9 @@ const
   NumSmallBlockTypes = 56;
 {$endif}
 
+  // TODO 1 -oPrimoz Gabrijelcic : *** TEMPORARY ***
+  CMaxNumaNodes = 8;
+
 {----------------------------Public types------------------------------}
 type
 
@@ -1182,7 +1185,7 @@ type
      free blocks)}
     ReservedAddressSpace: NativeUInt;
   end;
-  TSmallBlockTypeStates = array[0..NumSmallBlockTypes - 1] of TSmallBlockTypeState;
+  TSmallBlockTypeStates = array [0..NumSmallBlockTypes - 1] of TSmallBlockTypeState;
 
   TMemoryManagerState = record
     {Small block type states}
@@ -1537,6 +1540,36 @@ var
 {$endif}
 {$endif}
 
+// TODO 1 -oPrimoz Gabrijelcic : *** TEMPORARY, JUST FOR TESTING ***
+
+type
+  TProcessorNumber = record
+    Group   : word;
+    Number  : byte;
+    Reserved: byte;
+  end;
+  PProcessorNumber = ^TProcessorNumber;
+
+  TGroupAffinity = record
+    Mask    : NativeUInt;
+    Group   : word;
+    Reserved: array [0..2] of word;
+  end;
+  PGroupAffinity = ^TGroupAffinity;
+
+function SetThreadGroupAffinity(hThread: THandle; const GroupAffinity: TGroupAffinity;
+    PreviousGroupAffinity: PGroupAffinity): LongBool;
+
+function GetNumaHighestNodeNumber(var HighestNodeNunber: cardinal): LongBool; stdcall; external 'kernel32.dll';
+function GetNumaProcessorNodeEx(Processor: PProcessorNumber; var NodeNumber: word): LongBool; stdcall; external 'kernel32.dll';
+function GetCurrentProcessorNumber: cardinal; stdcall; external 'kernel32.dll';
+function GetThreadGroupAffinity(hThread: THandle; var GroupAffinity: TGroupAffinity): LongBool; stdcall; external 'kernel32.dll';
+function SetThreadGroupAffinityWin(hThread: THandle; const GroupAffinity: TGroupAffinity;
+    PreviousGroupAffinity: PGroupAffinity): LongBool; stdcall; external 'kernel32.dll' name 'SetThreadGroupAffinity';
+function VirtualAllocExNuma(hProcess: THandle; lpAddress: pointer; dwSize: NativeUInt;
+  flAllocationType: cardinal; flProtect: cardinal; nndPreferred: cardinal): pointer; stdcall;
+  external 'kernel32.dll';
+
 implementation
 
 uses
@@ -1780,9 +1813,9 @@ type
   {Pointer to the header of a small block pool}
   PSmallBlockPoolHeader = ^TSmallBlockPoolHeader;
 
-  {Small block type (Size = 32 bytes for 32-bit, 64 bytes for 64-bit).}
+  {Small block type.}
   PSmallBlockType = ^TSmallBlockType;
-  TSmallBlockType = record
+  TSmallBlockType = packed record
     {True = Block type is locked}
     BlockTypeLocked: Boolean;
     {Bitmap indicating which of the first 8 medium block groups contain blocks
@@ -1845,11 +1878,20 @@ type
     FirstFreeBlock: Pointer;
     {The number of blocks allocated in this pool.}
     BlocksInUse: Cardinal;
-    {Padding}
-    Reserved2: Cardinal;
+    {NUMA node. Defined even if NUMA support is disabled to provide padding.}
+    NumaNode: Integer;
     {The pool pointer and flags of the first block}
     FirstBlockPoolPointerAndFlags: NativeUInt;
   end;
+
+  TBlockHeader = packed record
+    FlagsAndSize: NativeUInt;
+    NumaNode: Integer;
+{$ifndef 32Bit}
+    Padding: Integer;
+{$endif}
+  end;
+  PBlockHeader = ^TBlockHeader;
 
   {Small block layout:
    At offset -SizeOf(Pointer) = Flags + address of the small block pool.
@@ -1939,7 +1981,6 @@ type
     ExpectedLeaks: array[0..(ExpectedMemoryLeaksListSize - 64) div SizeOf(TExpectedMemoryLeak) - 1] of TExpectedMemoryLeak;
   end;
   PExpectedMemoryLeaks = ^TExpectedMemoryLeaks;
-
 {$endif}
 
 {-------------------------Private constants----------------------------}
@@ -1949,7 +1990,8 @@ const
   reInvalidPtr = 2;
 {$endif}
   {The size of the block header in front of small and medium blocks}
-  BlockHeaderSize = SizeOf(Pointer);
+  // TODO 1 -oPrimoz Gabrijelcic : *** MUST CONTAIN NUMA NODE ***
+  BlockHeaderSize = SizeOf(TBlockHeader);
   {The size of a small block pool header}
   SmallBlockPoolHeaderSize = SizeOf(TSmallBlockPoolHeader);
   {The size of a medium block pool header}
@@ -1959,134 +2001,67 @@ const
 {$ifdef FullDebugMode}
   {We need space for the header, the trailer checksum and the trailing block
    size (only used by freed medium blocks).}
-  FullDebugBlockOverhead = SizeOf(TFullDebugBlockHeader) + SizeOf(NativeUInt) + SizeOf(Pointer);
+  FullDebugBlockOverhead = SizeOf(TFullDebugBlockHeader) + SizeOf(NativeUInt) + BlockHeaderSize;
 {$endif}
 
 {-------------------------Private variables----------------------------}
+{Small block initialization block.}
+const
+  CSmallBlockSizes: array [0..NumSmallBlockTypes - 1] of integer = (
+    {$ifndef Align16Bytes}8,{$endif} 16, {$ifndef Align16Bytes}24,{$endif} 32,
+    {$ifndef Align16Bytes}40,{$endif} 48, {$ifndef Align16Bytes}56,{$endif} 64,
+    {$ifndef Align16Bytes}72,{$endif} 80, {$ifndef Align16Bytes}88,{$endif} 96,
+    {$ifndef Align16Bytes}104,{$endif} 112, {$ifndef Align16Bytes}120,{$endif} 128,
+    {$ifndef Align16Bytes}136,{$endif} 144, {$ifndef Align16Bytes}152,{$endif} 160,
+    176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 352, 384, 416, 448, 480, 528,
+    576, 624, 672, 736, 800, 880, 960, 1056, 1152, 1264, 1376, 1504, 1648, 1808,
+    1984, 2176, 2384, MaximumSmallBlockSize,
+    {The last block size occurs three times. If, during a GetMem call, the
+     requested block size is already locked by another thread then up to two
+     larger block sizes may be used instead. Having the last block size occur
+     three times avoids the need to have a size overflow check.}
+    MaximumSmallBlockSize,
+    MaximumSmallBlockSize);
+
+  CSmallBlockMoves: array [0..NumSmallBlockTypes - 1] of TMoveProc = (
+    {$ifndef Align16Bytes}Move4,{$endif} {$ifdef 32Bit}Move12{$else}Move8{$endif},
+    {$ifndef Align16Bytes}Move20,{$endif} {$ifdef 32Bit}Move28{$else}Move24{$endif},
+    {$ifndef Align16Bytes}Move36,{$endif} {$ifdef 32Bit}Move44{$else}Move40{$endif},
+    {$ifndef Align16Bytes}Move52,{$endif} {$ifdef 32Bit}Move60{$else}Move56{$endif},
+    {$ifndef Align16Bytes}Move68,{$endif}
+    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil);
+
 var
   {-----------------Small block management------------------}
   {The small block types. Sizes include the leading header. Sizes are
    picked to limit maximum wastage to about 10% or 256 bytes (whichever is
    less) where possible.}
-  SmallBlockTypes: array[0..NumSmallBlockTypes - 1] of TSmallBlockType =(
-    {8/16 byte jumps}
-{$ifndef Align16Bytes}
-    (BlockSize: 8 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: Move4{$endif}),
-{$endif}
-    (BlockSize: 16 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: {$ifdef 32Bit}Move12{$else}Move8{$endif}{$endif}),
-{$ifndef Align16Bytes}
-    (BlockSize: 24 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: Move20{$endif}),
-{$endif}
-    (BlockSize: 32 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: {$ifdef 32Bit}Move28{$else}Move24{$endif}{$endif}),
-{$ifndef Align16Bytes}
-    (BlockSize: 40 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: Move36{$endif}),
-{$endif}
-    (BlockSize: 48 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: {$ifdef 32Bit}Move44{$else}Move40{$endif}{$endif}),
-{$ifndef Align16Bytes}
-    (BlockSize: 56 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: Move52{$endif}),
-{$endif}
-    (BlockSize: 64 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: {$ifdef 32Bit}Move60{$else}Move56{$endif}{$endif}),
-{$ifndef Align16Bytes}
-    (BlockSize: 72 {$ifdef UseCustomFixedSizeMoveRoutines}; UpsizeMoveProcedure: Move68{$endif}),
-{$endif}
-    (BlockSize: 80),
-{$ifndef Align16Bytes}
-    (BlockSize: 88),
-{$endif}
-    (BlockSize: 96),
-{$ifndef Align16Bytes}
-    (BlockSize: 104),
-{$endif}
-    (BlockSize: 112),
-{$ifndef Align16Bytes}
-    (BlockSize: 120),
-{$endif}
-    (BlockSize: 128),
-{$ifndef Align16Bytes}
-    (BlockSize: 136),
-{$endif}
-    (BlockSize: 144),
-{$ifndef Align16Bytes}
-    (BlockSize: 152),
-{$endif}
-    (BlockSize: 160),
-    {16 byte jumps}
-    (BlockSize: 176),
-    (BlockSize: 192),
-    (BlockSize: 208),
-    (BlockSize: 224),
-    (BlockSize: 240),
-    (BlockSize: 256),
-    (BlockSize: 272),
-    (BlockSize: 288),
-    (BlockSize: 304),
-    (BlockSize: 320),
-    {32 byte jumps}
-    (BlockSize: 352),
-    (BlockSize: 384),
-    (BlockSize: 416),
-    (BlockSize: 448),
-    (BlockSize: 480),
-    {48 byte jumps}
-    (BlockSize: 528),
-    (BlockSize: 576),
-    (BlockSize: 624),
-    (BlockSize: 672),
-    {64 byte jumps}
-    (BlockSize: 736),
-    (BlockSize: 800),
-    {80 byte jumps}
-    (BlockSize: 880),
-    (BlockSize: 960),
-    {96 byte jumps}
-    (BlockSize: 1056),
-    (BlockSize: 1152),
-    {112 byte jumps}
-    (BlockSize: 1264),
-    (BlockSize: 1376),
-    {128 byte jumps}
-    (BlockSize: 1504),
-    {144 byte jumps}
-    (BlockSize: 1648),
-    {160 byte jumps}
-    (BlockSize: 1808),
-    {176 byte jumps}
-    (BlockSize: 1984),
-    {192 byte jumps}
-    (BlockSize: 2176),
-    {208 byte jumps}
-    (BlockSize: 2384),
-    {224 byte jumps}
-    (BlockSize: MaximumSmallBlockSize),
-    {The last block size occurs three times. If, during a GetMem call, the
-     requested block size is already locked by another thread then up to two
-     larger block sizes may be used instead. Having the last block size occur
-     three times avoids the need to have a size overflow check.}
-    (BlockSize: MaximumSmallBlockSize),
-    (BlockSize: MaximumSmallBlockSize));
+  SmallBlockTypes: array [0..CMaxNumaNodes - 1] of array [0..NumSmallBlockTypes - 1] of TSmallBlockType;
   {Size to small block type translation table}
   AllocSize2SmallBlockTypeIndX4: array[0..(MaximumSmallBlockSize - 1) div SmallBlockGranularity] of Byte;
   {-----------------Medium block management------------------}
   {A dummy medium block pool header: Maintains a circular list of all medium
    block pools to enable memory leak detection on program shutdown.}
-  MediumBlockPoolsCircularList: TMediumBlockPoolHeader;
+  MediumBlockPoolsCircularList: array [0..CMaxNumaNodes-1] of TMediumBlockPoolHeader;
   {Are medium blocks locked?}
-  MediumBlocksLocked: Boolean;
+  MediumBlocksLocked: array [0..CMaxNumaNodes-1] of Boolean;
   {The sequential feed medium block pool.}
-  LastSequentiallyFedMediumBlock: Pointer;
-  MediumSequentialFeedBytesLeft: Cardinal;
+  LastSequentiallyFedMediumBlock: array [0..CMaxNumaNodes-1] of Pointer;
+  MediumSequentialFeedBytesLeft: array [0..CMaxNumaNodes-1] of Cardinal;
   {The medium block bins are divided into groups of 32 bins. If a bit
    is set in this group bitmap, then at least one bin in the group has free
    blocks.}
-  MediumBlockBinGroupBitmap: Cardinal;
+  MediumBlockBinGroupBitmap: array [0..CMaxNumaNodes-1] of Cardinal;
   {The medium block bins: total of 32 * 32 = 1024 bins of a certain
    minimum size.}
-  MediumBlockBinBitmaps: array[0..MediumBlockBinGroupCount - 1] of Cardinal;
+  MediumBlockBinBitmaps: array [0..CMaxNumaNodes-1] of array [0..MediumBlockBinGroupCount - 1] of Cardinal;
   {The medium block bins. There are 1024 LIFO circular linked lists each
    holding blocks of a specified minimum size. The sizes vary in size from
    MinimumMediumBlockSize to MaximumMediumBlockSize. The bins are treated as
    type TMediumFreeBlock to avoid pointer checks.}
-  MediumBlockBins: array[0..MediumBlockBinCount - 1] of TMediumFreeBlock;
+  MediumBlockBins: array [0..CMaxNumaNodes-1] of array [0..MediumBlockBinCount - 1] of TMediumFreeBlock;
   {-----------------Large block management------------------}
   {Are large blocks locked?}
   LargeBlocksLocked: Boolean;
@@ -2133,6 +2108,9 @@ var
   VMTBadInterface: array[0..MaxFakeVMTEntries - 1] of Pointer;
   {$endif}
 {$endif}
+
+  {---------------------NUMA support--------------------}
+  HighNUMANode: cardinal;
 
   {---------------------Lock contention logging--------------------}
 {$ifdef LogLockContention}
@@ -2203,6 +2181,52 @@ var
   InitializationCodeHasRun: Boolean = False;
 
 {----------------Utility Functions------------------}
+
+var
+  ThreadGACount: integer = 0;
+
+threadvar
+  CurrentNUMANode: integer;
+  CurrentThreadGACount: integer;
+
+// What if NUMA node changes? Can we make the assumption that it will not?
+// "Reintroduced" SetThreadGroupAffinity takes care of that (if programmer is careful).
+function GetThreadNUMANode: integer;
+var
+  ga: TGroupAffinity;
+  pn: TProcessorNumber;
+  nn: word;
+begin
+  // Automatically atomic on Intel
+  if CurrentThreadGACount < ThreadGACount then begin
+    CurrentThreadGACount := ThreadGACount;
+    CurrentNUMANode := 0;
+  end;
+
+  Result := CurrentNUMANode - 1;
+  if Result < 0 then begin
+    Result := 0;
+    if GetThreadGroupAffinity(GetCurrentThread, ga) then begin
+      pn.Group := ga.Group;
+      pn.Number := GetCurrentProcessorNumber;
+      pn.Reserved := 0;
+      if GetNumaProcessorNodeEx(@pn, nn) then
+        Result := nn;
+    end;
+    CurrentNUMANode := Result + 1;
+  end;
+end;
+
+function SetThreadGroupAffinity(hThread: THandle; const GroupAffinity: TGroupAffinity;
+  PreviousGroupAffinity: PGroupAffinity): LongBool;
+  begin
+  Result := SetThreadGroupAffinityWin(hThread, GroupAffinity, PreviousGroupAffinity);
+  if Result then
+    if hThread = GetCurrentThread then
+      CurrentNUMANode := 0
+    else // Automatically atomic on Intel
+      Inc(ThreadGACount);
+end;
 
 {A copy of StrLen in order to avoid the SysUtils unit, which would have
  introduced overhead like exception handling code.}
@@ -3696,24 +3720,41 @@ end;
 procedure LockAllSmallBlockTypes;
 var
   LInd: Cardinal;
+  LNumaNode: Integer;
 begin
-  {Lock the medium blocks}
-  for LInd := 0 to NumSmallBlockTypes - 1 do
+  {Step through all NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    while LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) <> 0 do
+    {Lock the medium blocks}
+    for LInd := 0 to NumSmallBlockTypes - 1 do
     begin
-{$ifdef NeverSleepOnThreadContention}
-{$ifdef UseSwitchToThread}
-      SwitchToThread;
-{$endif}
-{$else}
-      Sleep(InitialSleepTime);
-      if LockCmpxchg(0, 1, @SmallBlockTypes[LInd].BlockTypeLocked) = 0 then
-        Break;
-      Sleep(AdditionalSleepTime);
-{$endif}
+      while LockCmpxchg(0, 1, @SmallBlockTypes[LNumaNode, LInd].BlockTypeLocked) <> 0 do
+      begin
+  {$ifdef NeverSleepOnThreadContention}
+  {$ifdef UseSwitchToThread}
+        SwitchToThread;
+  {$endif}
+  {$else}
+        Sleep(InitialSleepTime);
+        if LockCmpxchg(0, 1, @SmallBlockTypes[LNumaNode, LInd].BlockTypeLocked) = 0 then
+          Break;
+        Sleep(AdditionalSleepTime);
+  {$endif}
+      end;
     end;
   end;
+end;
+
+{Unlock all the small block types}
+procedure UnlockAllSmallBlockTypes;
+var
+  LInd: Cardinal;
+  LNumaNode: Integer;
+begin
+  {Step through all NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
+    for LInd := 0 to NumSmallBlockTypes - 1 do
+      SmallBlockTypes[LNumaNode, LInd].BlockTypeLocked := False;
 end;
 
 {Gets the first and last block pointer for a small block pool}
@@ -3758,27 +3799,26 @@ begin
 end;
 
 {Gets the first medium block in the medium block pool}
-function GetFirstMediumBlockInPool(APMediumBlockPoolHeader: PMediumBlockPoolHeader): Pointer;
+function GetFirstMediumBlockInPool(numaNode: integer; APMediumBlockPoolHeader: PMediumBlockPoolHeader): Pointer;
 begin
-  if (MediumSequentialFeedBytesLeft = 0)
-    or (UIntPtr(LastSequentiallyFedMediumBlock) < UIntPtr(APMediumBlockPoolHeader))
-    or (UIntPtr(LastSequentiallyFedMediumBlock) > UIntPtr(APMediumBlockPoolHeader) + MediumBlockPoolSize) then
+  if (MediumSequentialFeedBytesLeft[numaNode] = 0)
+    or (UIntPtr(LastSequentiallyFedMediumBlock[numaNode]) < UIntPtr(APMediumBlockPoolHeader))
+    or (UIntPtr(LastSequentiallyFedMediumBlock[numaNode]) > UIntPtr(APMediumBlockPoolHeader) + MediumBlockPoolSize) then
   begin
     Result := Pointer(PByte(APMediumBlockPoolHeader) + MediumBlockPoolHeaderSize);
   end
   else
   begin
     {Is the sequential feed pool empty?}
-    if MediumSequentialFeedBytesLeft <> MediumBlockPoolSize - MediumBlockPoolHeaderSize then
-      Result := LastSequentiallyFedMediumBlock
+    if MediumSequentialFeedBytesLeft[numaNode] <> MediumBlockPoolSize - MediumBlockPoolHeaderSize then
+      Result := LastSequentiallyFedMediumBlock[numaNode]
     else
       Result := nil;
   end;
 end;
 
-{Locks the medium blocks. Note that the 32-bit asm version is assumed to
- preserve all registers except eax.}
-procedure LockMediumBlocks(
+{Locks the medium blocks.}
+procedure LockMediumBlocks(numaNode: integer;
   {$ifdef LogLockContention}var ADidSleep: Boolean{$ifdef UseReleaseStack};{$endif}{$endif}
   {$ifdef UseReleaseStack}APointer: Pointer = nil; APDelayRelease: PBoolean = nil{$endif});
 {$ifdef UseReleaseStack}
@@ -3790,7 +3830,7 @@ begin
 {$ifdef LogLockContention}
   ADidSleep := False;
 {$endif}
-  while LockCmpxchg(0, 1, @MediumBlocksLocked) <> 0 do
+  while LockCmpxchg(0, 1, @MediumBlocksLocked[numaNode]) <> 0 do
   begin
 {$ifdef UseReleaseStack}
     if Assigned(APointer) then
@@ -3813,7 +3853,7 @@ begin
 {$endif}
 {$else}
     Sleep(InitialSleepTime);
-    if LockCmpxchg(0, 1, @MediumBlocksLocked) = 0 then
+    if LockCmpxchg(0, 1, @MediumBlocksLocked[numaNode]) = 0 then
       Break;
     Sleep(AdditionalSleepTime);
 {$endif}
@@ -3827,8 +3867,7 @@ end;
 {Removes a medium block from the circular linked list of free blocks.
  Does not change any header flags. Medium blocks should be locked
  before calling this procedure.}
-procedure RemoveMediumFreeBlock(APMediumFreeBlock: PMediumFreeBlock);
-{$ifndef ASMVersion}
+procedure RemoveMediumFreeBlock(numaNode: integer; APMediumFreeBlock: PMediumFreeBlock);
 var
   LPreviousFreeBlock, LNextFreeBlock: PMediumFreeBlock;
   LBinNumber, LBinGroupNumber: Cardinal;
@@ -3844,100 +3883,23 @@ begin
   if LPreviousFreeBlock = LNextFreeBlock then
   begin
     {Get the bin number for this block size}
-    LBinNumber := (UIntPtr(LNextFreeBlock) - UIntPtr(@MediumBlockBins)) div SizeOf(TMediumFreeBlock);
+    LBinNumber := (UIntPtr(LNextFreeBlock) - UIntPtr(@MediumBlockBins[numaNode])) div SizeOf(TMediumFreeBlock);
     LBinGroupNumber := LBinNumber div 32;
     {Flag this bin as empty}
-    MediumBlockBinBitmaps[LBinGroupNumber] := MediumBlockBinBitmaps[LBinGroupNumber]
+    MediumBlockBinBitmaps[numaNode, LBinGroupNumber] := MediumBlockBinBitmaps[numaNode, LBinGroupNumber]
       and (not (1 shl (LBinNumber and 31)));
     {Is the group now entirely empty?}
-    if MediumBlockBinBitmaps[LBinGroupNumber] = 0 then
+    if MediumBlockBinBitmaps[numaNode, LBinGroupNumber] = 0 then
     begin
       {Flag this group as empty}
-      MediumBlockBinGroupBitmap := MediumBlockBinGroupBitmap
+      MediumBlockBinGroupBitmap[numaNode] := MediumBlockBinGroupBitmap[numaNode]
         and (not (1 shl LBinGroupNumber));
     end;
   end;
 end;
-{$else}
-{$ifdef 32Bit}
-asm
-  {On entry: eax = APMediumFreeBlock}
-  {Get the current previous and next blocks}
-  mov ecx, TMediumFreeBlock[eax].NextFreeBlock
-  mov edx, TMediumFreeBlock[eax].PreviousFreeBlock
-  {Is this bin now empty? If the previous and next free block pointers are
-   equal, they must point to the bin.}
-  cmp ecx, edx
-  {Remove this block from the linked list}
-  mov TMediumFreeBlock[ecx].PreviousFreeBlock, edx
-  mov TMediumFreeBlock[edx].NextFreeBlock, ecx
-  {Is this bin now empty? If the previous and next free block pointers are
-   equal, they must point to the bin.}
-  je @BinIsNowEmpty
-@Done:
-  ret
-  {Align branch target}
-  nop
-@BinIsNowEmpty:
-  {Get the bin number for this block size in ecx}
-  sub ecx, offset MediumBlockBins
-  mov edx, ecx
-  shr ecx, 3
-  {Get the group number in edx}
-  movzx edx, dh
-  {Flag this bin as empty}
-  mov eax, -2
-  rol eax, cl
-  and dword ptr [MediumBlockBinBitmaps + edx * 4], eax
-  jnz @Done
-  {Flag this group as empty}
-  mov eax, -2
-  mov ecx, edx
-  rol eax, cl
-  and MediumBlockBinGroupBitmap, eax
-end;
-{$else}
-asm
-  {On entry: rcx = APMediumFreeBlock}
-  mov rax, rcx
-  {Get the current previous and next blocks}
-  mov rcx, TMediumFreeBlock[rax].NextFreeBlock
-  mov rdx, TMediumFreeBlock[rax].PreviousFreeBlock
-  {Is this bin now empty? If the previous and next free block pointers are
-   equal, they must point to the bin.}
-  cmp rcx, rdx
-  {Remove this block from the linked list}
-  mov TMediumFreeBlock[rcx].PreviousFreeBlock, rdx
-  mov TMediumFreeBlock[rdx].NextFreeBlock, rcx
-  {Is this bin now empty? If the previous and next free block pointers are
-   equal, they must point to the bin.}
-  jne @Done
-  {Get the bin number for this block size in rcx}
-  lea r8, MediumBlockBins
-  sub rcx, r8
-  mov edx, ecx
-  shr ecx, 4
-  {Get the group number in edx}
-  shr edx, 9
-  {Flag this bin as empty}
-  mov eax, -2
-  rol eax, cl
-  lea r8, MediumBlockBinBitmaps
-  and dword ptr [r8 + rdx * 4], eax
-  jnz @Done
-  {Flag this group as empty}
-  mov eax, -2
-  mov ecx, edx
-  rol eax, cl
-  and MediumBlockBinGroupBitmap, eax
-@Done:
-end;
-{$endif}
-{$endif}
 
 {Inserts a medium block into the appropriate medium block bin.}
-procedure InsertMediumBlockIntoBin(APMediumFreeBlock: PMediumFreeBlock; AMediumBlockSize: Cardinal);
-{$ifndef ASMVersion}
+procedure InsertMediumBlockIntoBin(numaNode: integer; APMediumFreeBlock: PMediumFreeBlock; AMediumBlockSize: Cardinal);
 var
   LBinNumber, LBinGroupNumber: Cardinal;
   LPBin, LPFirstFreeBlock: PMediumFreeBlock;
@@ -3948,7 +3910,7 @@ begin
   if LBinNumber >= MediumBlockBinCount then
     LBinNumber := MediumBlockBinCount - 1;
   {Get the bin}
-  LPBin := @MediumBlockBins[LBinNumber];
+  LPBin := @MediumBlockBins[numaNode, LBinNumber];
   {Bins are LIFO, se we insert this block as the first free block in the bin}
   LPFirstFreeBlock := LPBin.NextFreeBlock;
   APMediumFreeBlock.PreviousFreeBlock := LPBin;
@@ -3961,120 +3923,26 @@ begin
     {Get the group number}
     LBinGroupNumber := LBinNumber div 32;
     {Flag this bin as used}
-    MediumBlockBinBitmaps[LBinGroupNumber] := MediumBlockBinBitmaps[LBinGroupNumber]
+    MediumBlockBinBitmaps[numaNode, LBinGroupNumber] := MediumBlockBinBitmaps[numaNode, LBinGroupNumber]
       or (1 shl (LBinNumber and 31));
     {Flag the group as used}
-    MediumBlockBinGroupBitmap := MediumBlockBinGroupBitmap
+    MediumBlockBinGroupBitmap[numaNode] := MediumBlockBinGroupBitmap[numaNode]
       or (1 shl LBinGroupNumber);
   end;
 end;
-{$else}
-{$ifdef 32Bit}
-asm
-  {On entry: eax = APMediumFreeBlock, edx = AMediumBlockSize}
-  {Get the bin number for this block size. Get the bin that holds blocks of at
-   least this size.}
-  sub edx, MinimumMediumBlockSize
-  shr edx, 8
-  {Validate the bin number}
-  sub edx, MediumBlockBinCount - 1
-  sbb ecx, ecx
-  and edx, ecx
-  add edx, MediumBlockBinCount - 1
-  {Get the bin in ecx}
-  lea ecx, [MediumBlockBins + edx * 8]
-  {Bins are LIFO, se we insert this block as the first free block in the bin}
-  mov edx, TMediumFreeBlock[ecx].NextFreeBlock
-  {Was this bin empty?}
-  cmp edx, ecx
-  mov TMediumFreeBlock[eax].PreviousFreeBlock, ecx
-  mov TMediumFreeBlock[eax].NextFreeBlock, edx
-  mov TMediumFreeBlock[edx].PreviousFreeBlock, eax
-  mov TMediumFreeBlock[ecx].NextFreeBlock, eax
-  {Was this bin empty?}
-  je @BinWasEmpty
-  ret
-  {Align branch target}
-  nop
-  nop
-@BinWasEmpty:
-  {Get the bin number in ecx}
-  sub ecx, offset MediumBlockBins
-  mov edx, ecx
-  shr ecx, 3
-  {Get the group number in edx}
-  movzx edx, dh
-  {Flag this bin as not empty}
-  mov eax, 1
-  shl eax, cl
-  or dword ptr [MediumBlockBinBitmaps + edx * 4], eax
-  {Flag the group as not empty}
-  mov eax, 1
-  mov ecx, edx
-  shl eax, cl
-  or MediumBlockBinGroupBitmap, eax
-end;
-{$else}
-asm
-  {On entry: rax = APMediumFreeBlock, edx = AMediumBlockSize}
-  mov rax, rcx
-  {Get the bin number for this block size. Get the bin that holds blocks of at
-   least this size.}
-  sub edx, MinimumMediumBlockSize
-  shr edx, 8
-  {Validate the bin number}
-  sub edx, MediumBlockBinCount - 1
-  sbb ecx, ecx
-  and edx, ecx
-  add edx, MediumBlockBinCount - 1
-  mov r9, rdx
-  {Get the bin address in rcx}
-  lea rcx, MediumBlockBins
-  shl edx, 4
-  add rcx, rdx
-  {Bins are LIFO, se we insert this block as the first free block in the bin}
-  mov rdx, TMediumFreeBlock[rcx].NextFreeBlock
-  {Was this bin empty?}
-  cmp rdx, rcx
-  mov TMediumFreeBlock[rax].PreviousFreeBlock, rcx
-  mov TMediumFreeBlock[rax].NextFreeBlock, rdx
-  mov TMediumFreeBlock[rdx].PreviousFreeBlock, rax
-  mov TMediumFreeBlock[rcx].NextFreeBlock, rax
-  {Was this bin empty?}
-  jne @Done
-  {Get the bin number in ecx}
-  mov rcx, r9
-  {Get the group number in edx}
-  mov rdx, r9
-  shr edx, 5
-  {Flag this bin as not empty}
-  mov eax, 1
-  shl eax, cl
-  lea r8, MediumBlockBinBitmaps
-  or dword ptr [r8 + rdx * 4], eax
-  {Flag the group as not empty}
-  mov eax, 1
-  mov ecx, edx
-  shl eax, cl
-  or MediumBlockBinGroupBitmap, eax
-@Done:
-end;
-{$endif}
-{$endif}
 
 {Bins what remains in the current sequential feed medium block pool. Medium
  blocks must be locked.}
-procedure BinMediumSequentialFeedRemainder;
-{$ifndef ASMVersion}
+procedure BinMediumSequentialFeedRemainder(numaNode: integer);
 var
   LSequentialFeedFreeSize, LNextBlockSizeAndFlags: NativeUInt;
   LPRemainderBlock, LNextMediumBlock: Pointer;
 begin
-  LSequentialFeedFreeSize := MediumSequentialFeedBytesLeft;
+  LSequentialFeedFreeSize := MediumSequentialFeedBytesLeft[numaNode];
   if LSequentialFeedFreeSize > 0 then
   begin
     {Get the block after the open space}
-    LNextMediumBlock := LastSequentiallyFedMediumBlock;
+    LNextMediumBlock := LastSequentiallyFedMediumBlock[numaNode];
     LNextBlockSizeAndFlags := PNativeUInt(PByte(LNextMediumBlock) - BlockHeaderSize)^;
     {Point to the remainder}
     LPRemainderBlock := Pointer(PByte(LNextMediumBlock) - LSequentialFeedFreeSize);
@@ -4086,7 +3954,7 @@ begin
       Inc(LSequentialFeedFreeSize, LNextBlockSizeAndFlags and DropMediumAndLargeFlagsMask);
       {Remove the next block as well}
       if (LNextBlockSizeAndFlags and DropMediumAndLargeFlagsMask) >= MinimumMediumBlockSize then
-        RemoveMediumFreeBlock(LNextMediumBlock);
+        RemoveMediumFreeBlock(numaNode, LNextMediumBlock);
     end
     else
     begin
@@ -4113,161 +3981,52 @@ begin
 {$endif}
     {Bin this medium block}
     if LSequentialFeedFreeSize >= MinimumMediumBlockSize then
-      InsertMediumBlockIntoBin(LPRemainderBlock, LSequentialFeedFreeSize);
+      InsertMediumBlockIntoBin(numaNode, LPRemainderBlock, LSequentialFeedFreeSize);
   end;
 end;
-{$else}
-{$ifdef 32Bit}
-asm
-  cmp MediumSequentialFeedBytesLeft, 0
-  jne @MustBinMedium
-  {Nothing to bin}
-  ret
-  {Align branch target}
-  nop
-  nop
-@MustBinMedium:
-  {Get a pointer to the last sequentially allocated medium block}
-  mov eax, LastSequentiallyFedMediumBlock
-  {Is the block that was last fed sequentially free?}
-  test byte ptr [eax - 4], IsFreeBlockFlag
-  jnz @LastBlockFedIsFree
-  {Set the "previous block is free" flag in the last block fed}
-  or dword ptr [eax - 4], PreviousMediumBlockIsFreeFlag
-  {Get the remainder in edx}
-  mov edx, MediumSequentialFeedBytesLeft
-  {Point eax to the start of the remainder}
-  sub eax, edx
-@BinTheRemainder:
-  {Status: eax = start of remainder, edx = size of remainder}
-  {Store the size of the block as well as the flags}
-  lea ecx, [edx + IsMediumBlockFlag + IsFreeBlockFlag]
-  mov [eax - 4], ecx
-  {Store the trailing size marker}
-  mov [eax + edx - 8], edx
-  {Bin this medium block}
-  cmp edx, MinimumMediumBlockSize
-  jnb InsertMediumBlockIntoBin
-  ret
-  {Align branch target}
-  nop
-  nop
-@LastBlockFedIsFree:
-  {Drop the flags}
-  mov edx, DropMediumAndLargeFlagsMask
-  and edx, [eax - 4]
-  {Free the last block fed}
-  cmp edx, MinimumMediumBlockSize
-  jb @DontRemoveLastFed
-  {Last fed block is free - remove it from its size bin}
-  call RemoveMediumFreeBlock
-  {Re-read eax and edx}
-  mov eax, LastSequentiallyFedMediumBlock
-  mov edx, DropMediumAndLargeFlagsMask
-  and edx, [eax - 4]
-@DontRemoveLastFed:
-  {Get the number of bytes left in ecx}
-  mov ecx, MediumSequentialFeedBytesLeft
-  {Point eax to the start of the remainder}
-  sub eax, ecx
-  {edx = total size of the remainder}
-  add edx, ecx
-  jmp @BinTheRemainder
-@Done:
-end;
-{$else}
-asm
-  .params 2
-  xor eax, eax
-  cmp MediumSequentialFeedBytesLeft, eax
-  je @Done
-  {Get a pointer to the last sequentially allocated medium block}
-  mov rax, LastSequentiallyFedMediumBlock
-  {Is the block that was last fed sequentially free?}
-  test byte ptr [rax - BlockHeaderSize], IsFreeBlockFlag
-  jnz @LastBlockFedIsFree
-  {Set the "previous block is free" flag in the last block fed}
-  or qword ptr [rax - BlockHeaderSize], PreviousMediumBlockIsFreeFlag
-  {Get the remainder in edx}
-  mov edx, MediumSequentialFeedBytesLeft
-  {Point eax to the start of the remainder}
-  sub rax, rdx
-@BinTheRemainder:
-  {Status: rax = start of remainder, edx = size of remainder}
-  {Store the size of the block as well as the flags}
-  lea rcx, [rdx + IsMediumBlockFlag + IsFreeBlockFlag]
-  mov [rax - BlockHeaderSize], rcx
-  {Store the trailing size marker}
-  mov [rax + rdx - 2 * BlockHeaderSize], rdx
-  {Bin this medium block}
-  cmp edx, MinimumMediumBlockSize
-  jb @Done
-  mov rcx, rax
-  call InsertMediumBlockIntoBin
-  jmp @Done
-@LastBlockFedIsFree:
-  {Drop the flags}
-  mov rdx, DropMediumAndLargeFlagsMask
-  and rdx, [rax - BlockHeaderSize]
-  {Free the last block fed}
-  cmp edx, MinimumMediumBlockSize
-  jb @DontRemoveLastFed
-  {Last fed block is free - remove it from its size bin}
-  mov rcx, rax
-  call RemoveMediumFreeBlock
-  {Re-read rax and rdx}
-  mov rax, LastSequentiallyFedMediumBlock
-  mov rdx, DropMediumAndLargeFlagsMask
-  and rdx, [rax - BlockHeaderSize]
-@DontRemoveLastFed:
-  {Get the number of bytes left in ecx}
-  mov ecx, MediumSequentialFeedBytesLeft
-  {Point rax to the start of the remainder}
-  sub rax, rcx
-  {edx = total size of the remainder}
-  add edx, ecx
-  jmp @BinTheRemainder
-@Done:
-end;
-{$endif}
-{$endif}
 
 {Allocates a new sequential feed medium block pool and immediately splits off a
  block of the requested size. The block size must be a multiple of 16 and
  medium blocks must be locked.}
-function AllocNewSequentialFeedMediumPool(AFirstBlockSize: Cardinal): Pointer;
+function AllocNewSequentialFeedMediumPool(ANumaNode: integer; AFirstBlockSize: Cardinal):
+  Pointer;
 var
   LOldFirstMediumBlockPool: PMediumBlockPoolHeader;
   LNewPool: Pointer;
 begin
   {Bin the current sequential feed remainder}
-  BinMediumSequentialFeedRemainder;
+  BinMediumSequentialFeedRemainder(ANumaNode);
   {Allocate a new sequential feed block pool}
-  // ***NUMA***
-  LNewPool := VirtualAlloc(nil, MediumBlockPoolSize,
-    MEM_COMMIT{$ifdef AlwaysAllocateTopDown} or MEM_TOP_DOWN{$endif}, PAGE_READWRITE);
+  // *** TEMPORARY ***
+  LNewPool := VirtualAllocExNuma($FFFFFFFF {GetCurrentProcess}, nil, MediumBlockPoolSize,
+    MEM_RESERVE or MEM_COMMIT{$ifdef AlwaysAllocateTopDown} or MEM_TOP_DOWN{$endif}, PAGE_READWRITE, ANumaNode);
+//  LNewPool := VirtualAlloc(nil, MediumBlockPoolSize,
+//    MEM_RESERVE or MEM_COMMIT{$ifdef AlwaysAllocateTopDown} or MEM_TOP_DOWN{$endif}, PAGE_READWRITE);
   if LNewPool <> nil then
   begin
     {Insert this block pool into the list of block pools}
-    LOldFirstMediumBlockPool := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
+    LOldFirstMediumBlockPool := MediumBlockPoolsCircularList[ANumaNode].NextMediumBlockPoolHeader;
     PMediumBlockPoolHeader(LNewPool).PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
-    MediumBlockPoolsCircularList.NextMediumBlockPoolHeader := LNewPool;
+    MediumBlockPoolsCircularList[ANumaNode].NextMediumBlockPoolHeader := LNewPool;
     PMediumBlockPoolHeader(LNewPool).NextMediumBlockPoolHeader := LOldFirstMediumBlockPool;
     LOldFirstMediumBlockPool.PreviousMediumBlockPoolHeader := LNewPool;
     {Store the sequential feed pool trailer}
     PNativeUInt(PByte(LNewPool) + MediumBlockPoolSize - BlockHeaderSize)^ := IsMediumBlockFlag;
     {Get the number of bytes still available}
-    MediumSequentialFeedBytesLeft := (MediumBlockPoolSize - MediumBlockPoolHeaderSize) - AFirstBlockSize;
+    MediumSequentialFeedBytesLeft[ANumaNode] := (MediumBlockPoolSize - MediumBlockPoolHeaderSize) - AFirstBlockSize;
     {Get the result}
     Result := Pointer(PByte(LNewPool) + MediumBlockPoolSize - AFirstBlockSize);
-    LastSequentiallyFedMediumBlock := Result;
-    {Store the block header}
-    PNativeUInt(PByte(Result) - BlockHeaderSize)^ := AFirstBlockSize or IsMediumBlockFlag;
+    LastSequentiallyFedMediumBlock[ANumaNode] := Result;
+    {Store the block header and NUMA node}
+    with PBlockHeader(PByte(Result) - BlockHeaderSize)^  do begin
+      FlagsAndSize := AFirstBlockSize or IsMediumBlockFlag;
+      NumaNode := ANumaNode;
+    end;
   end
   else
   begin
     {Out of memory}
-    MediumSequentialFeedBytesLeft := 0;
+    MediumSequentialFeedBytesLeft[ANumaNode] := 0;
     Result := nil;
   end;
 end;
@@ -4336,9 +4095,11 @@ begin
   LLargeUsedBlockSize := (ASize + LargeBlockHeaderSize + LargeBlockGranularity - 1 + BlockHeaderSize)
     and -LargeBlockGranularity;
   {Get the Large block}
-  // ***NUMA***
-  Result := VirtualAlloc(nil, LLargeUsedBlockSize, MEM_COMMIT or MEM_TOP_DOWN,
-    PAGE_READWRITE);
+  // ***TEMPORARY***
+  Result := VirtualAllocExNuma($FFFFFFFF {GetCurrentProcess}, nil, LLargeUsedBlockSize,
+    MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE, GetThreadNUMANode);
+//  Result := VirtualAlloc(nil, LLargeUsedBlockSize, MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN,
+//    PAGE_READWRITE);
   {Set the Large block fields}
   if Result <> nil then
   begin
@@ -4637,10 +4398,12 @@ var
 {$ifdef UseReleaseStack}
   LPReleaseStack: ^TLFStack;
 {$endif}
+  LNumaNode: integer;
 begin
 {$ifdef LogLockContention}
   ACollector := nil;
 {$endif}
+  LNumaNode := GetThreadNUMANode;
   {Is it a small block? -> Take the header size into account when
    determining the required block size}
   if NativeUInt(ASize) <= (MaximumSmallBlockSize - BlockHeaderSize) then
@@ -4650,7 +4413,7 @@ begin
     LPSmallBlockType := PSmallBlockType(AllocSize2SmallBlockTypeIndX4[
       (NativeUInt(ASize) + (BlockHeaderSize - 1)) div SmallBlockGranularity]
       * (SizeOf(TSmallBlockType) div 4)
-      + UIntPtr(@SmallBlockTypes));
+      + UIntPtr(@SmallBlockTypes[LNumaNode]));
 {$ifdef UseReleaseStack}
     LPReleaseStack := @LPSmallBlockType.ReleaseStack[GetStackSlot];
     if (not LPReleaseStack^.IsEmpty) and LPReleaseStack^.Pop(Result) then
@@ -4738,22 +4501,22 @@ begin
       else
       begin
         {Need to allocate a pool: Lock the medium blocks}
-        LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
+        LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
 {$ifdef LogLockContention}
         if LDidSleep then
           ACollector := @MediumBlockCollector;
 {$endif}
 {$ifndef FullDebugMode}
         {Are there any available blocks of a suitable size?}
-        LBinGroupsMasked := MediumBlockBinGroupBitmap and ($ffffff00 or LPSmallBlockType.AllowedGroupsForBlockPoolBitmap);
+        LBinGroupsMasked := MediumBlockBinGroupBitmap[LNumaNode] and ($ffffff00 or LPSmallBlockType.AllowedGroupsForBlockPoolBitmap);
         if LBinGroupsMasked <> 0 then
         begin
           {Get the bin group with free blocks}
           LBinGroupNumber := FindFirstSetBit(LBinGroupsMasked);
           {Get the bin in the group with free blocks}
-          LBinNumber := FindFirstSetBit(MediumBlockBinBitmaps[LBinGroupNumber])
+          LBinNumber := FindFirstSetBit(MediumBlockBinBitmaps[LNumaNode, LBinGroupNumber])
             + LBinGroupNumber * 32;
-          LPMediumBin := @MediumBlockBins[LBinNumber];
+          LPMediumBin := @MediumBlockBins[LNumaNode, LBinNumber];
           {Get the first block in the bin}
           LMediumBlock := LPMediumBin.NextFreeBlock;
           {Remove the first block from the linked list (LIFO)}
@@ -4764,13 +4527,13 @@ begin
           if LNextFreeBlock = LPMediumBin then
           begin
             {Flag this bin as empty}
-            MediumBlockBinBitmaps[LBinGroupNumber] := MediumBlockBinBitmaps[LBinGroupNumber]
+            MediumBlockBinBitmaps[LNumaNode, LBinGroupNumber] := MediumBlockBinBitmaps[LNumaNode, LBinGroupNumber]
               and (not (1 shl (LBinNumber and 31)));
             {Is the group now entirely empty?}
-            if MediumBlockBinBitmaps[LBinGroupNumber] = 0 then
+            if MediumBlockBinBitmaps[LNumaNode, LBinGroupNumber] = 0 then
             begin
               {Flag this group as empty}
-              MediumBlockBinGroupBitmap := MediumBlockBinGroupBitmap
+              MediumBlockBinGroupBitmap[LNumaNode] := MediumBlockBinGroupBitmap[LNumaNode]
                 and (not (1 shl LBinGroupNumber));
             end;
           end;
@@ -4803,7 +4566,7 @@ begin
             {Store the size of the second split as the second last dword/qword}
             PNativeUInt(PByte(LSecondSplit) + LSecondSplitSize - 2 * BlockHeaderSize)^ := LSecondSplitSize;
             {Put the remainder in a bin (it will be big enough)}
-            InsertMediumBlockIntoBin(LSecondSplit, LSecondSplitSize);
+            InsertMediumBlockIntoBin(LNumaNode, LSecondSplit, LSecondSplitSize);
           end
           else
           begin
@@ -4816,7 +4579,7 @@ begin
         begin
 {$endif}
           {Check the sequential feed medium block pool for space}
-          LSequentialFeedFreeSize := MediumSequentialFeedBytesLeft;
+          LSequentialFeedFreeSize := MediumSequentialFeedBytesLeft[LNumaNode];
           if LSequentialFeedFreeSize >= LPSmallBlockType.MinimumBlockPoolSize then
           begin
             {Enough sequential feed space: Will the remainder be usable?}
@@ -4827,10 +4590,10 @@ begin
             else
               LBlockSize := LSequentialFeedFreeSize;
             {Get the block}
-            LMediumBlock := Pointer(PByte(LastSequentiallyFedMediumBlock) - LBlockSize);
+            LMediumBlock := Pointer(PByte(LastSequentiallyFedMediumBlock[LNumaNode]) - LBlockSize);
             {Update the sequential feed parameters}
-            LastSequentiallyFedMediumBlock := LMediumBlock;
-            MediumSequentialFeedBytesLeft := LSequentialFeedFreeSize - LBlockSize;
+            LastSequentiallyFedMediumBlock[LNumaNode] := LMediumBlock;
+            MediumSequentialFeedBytesLeft[LNumaNode] := LSequentialFeedFreeSize - LBlockSize;
           end
           else
           begin
@@ -4838,12 +4601,12 @@ begin
              optimal size for this small block pool}
             LBlockSize := LPSmallBlockType.OptimalBlockPoolSize;
             {Allocate the medium block pool}
-            LMediumBlock := AllocNewSequentialFeedMediumPool(LBlockSize);
+            LMediumBlock := AllocNewSequentialFeedMediumPool(LNumaNode, LBlockSize);
             if LMediumBlock = nil then
             begin
               {Out of memory}
               {Unlock the medium blocks}
-              MediumBlocksLocked := False;
+              MediumBlocksLocked[LNumaNode] := False;
               {Unlock the block type}
               LPSmallBlockType.BlockTypeLocked := False;
               {Failed}
@@ -4859,12 +4622,13 @@ begin
         {Set the size and flags for this block}
         PNativeUInt(PByte(LMediumBlock) - BlockHeaderSize)^ := LBlockSize or IsMediumBlockFlag or IsSmallBlockPoolInUseFlag;
         {Unlock medium blocks}
-        MediumBlocksLocked := False;
+        MediumBlocksLocked[LNumaNode] := False;
         {Set up the block pool}
         LPSmallBlockPool := PSmallBlockPoolHeader(LMediumBlock);
         LPSmallBlockPool.BlockType := LPSmallBlockType;
         LPSmallBlockPool.FirstFreeBlock := nil;
         LPSmallBlockPool.BlocksInUse := 1;
+        LPSmallBlockPool.NumaNode := LNumaNode;
         {Set it up for sequential block serving}
         LPSmallBlockType.CurrentSequentialFeedPool := LPSmallBlockPool;
         Result := Pointer(PByte(LPSmallBlockPool) + SmallBlockPoolHeaderSize);
@@ -4900,7 +4664,7 @@ begin
       {Get the bin number}
       LBinNumber := (LBlockSize - MinimumMediumBlockSize) div MediumBlockGranularity;
       {Lock the medium blocks}
-      LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
+      LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
 {$ifdef LogLockContention}
       if LDidSleep then
         ACollector := @MediumBlockCollector;
@@ -4908,7 +4672,7 @@ begin
       {Calculate the bin group}
       LBinGroupNumber := LBinNumber div 32;
       {Is there a suitable block inside this group?}
-      LBinGroupMasked := MediumBlockBinBitmaps[LBinGroupNumber] and -(1 shl (LBinNumber and 31));
+      LBinGroupMasked := MediumBlockBinBitmaps[LNumaNode, LBinGroupNumber] and -(1 shl (LBinNumber and 31));
       if LBinGroupMasked <> 0 then
       begin
         {Get the actual bin number}
@@ -4918,20 +4682,20 @@ begin
       begin
 {$ifndef FullDebugMode}
         {Try all groups greater than this group}
-        LBinGroupsMasked := MediumBlockBinGroupBitmap and -(2 shl LBinGroupNumber);
+        LBinGroupsMasked := MediumBlockBinGroupBitmap[LNumaNode] and -(2 shl LBinGroupNumber);
         if LBinGroupsMasked <> 0 then
         begin
           {There is a suitable group with space: get the bin number}
           LBinGroupNumber := FindFirstSetBit(LBinGroupsMasked);
           {Get the bin in the group with free blocks}
-          LBinNumber := FindFirstSetBit(MediumBlockBinBitmaps[LBinGroupNumber])
+          LBinNumber := FindFirstSetBit(MediumBlockBinBitmaps[LNumaNode, LBinGroupNumber])
             + LBinGroupNumber * 32;
         end
         else
         begin
 {$endif}
           {There are no bins with a suitable block: Sequentially feed the required block}
-          LSequentialFeedFreeSize := MediumSequentialFeedBytesLeft;
+          LSequentialFeedFreeSize := MediumSequentialFeedBytesLeft[LNumaNode];
           if LSequentialFeedFreeSize >= LBlockSize then
           begin
 {$ifdef FullDebugMode}
@@ -4942,18 +4706,18 @@ begin
               LBlockSize := LSequentialFeedFreeSize;
 {$endif}
             {Block can be fed sequentially}
-            Result := Pointer(PByte(LastSequentiallyFedMediumBlock) - LBlockSize);
+            Result := Pointer(PByte(LastSequentiallyFedMediumBlock[LNumaNode]) - LBlockSize);
             {Store the last sequentially fed block}
-            LastSequentiallyFedMediumBlock := Result;
+            LastSequentiallyFedMediumBlock[LNumaNode] := Result;
             {Store the remaining bytes}
-            MediumSequentialFeedBytesLeft := LSequentialFeedFreeSize - LBlockSize;
+            MediumSequentialFeedBytesLeft[LNumaNode] := LSequentialFeedFreeSize - LBlockSize;
             {Set the flags for the block}
             PNativeUInt(PByte(Result) - BlockHeaderSize)^ := LBlockSize or IsMediumBlockFlag;
           end
           else
           begin
             {Need to allocate a new sequential feed block}
-            Result := AllocNewSequentialFeedMediumPool(LBlockSize);
+            Result := AllocNewSequentialFeedMediumPool(LNumaNode, LBlockSize);
           end;
 {$ifdef FullDebugMode}
           {Block was fed sequentially - we need to set a valid debug header}
@@ -4968,7 +4732,7 @@ begin
           end;
 {$endif}
           {Done}
-          MediumBlocksLocked := False;
+          MediumBlocksLocked[LNumaNode] := False;
           Exit;
 {$ifndef FullDebugMode}
         end;
@@ -4977,7 +4741,7 @@ begin
       {If we get here we have a valid LBinGroupNumber and LBinNumber:
        Use the first block in the bin, splitting it if necessary}
       {Get a pointer to the bin}
-      LPMediumBin := @MediumBlockBins[LBinNumber];
+      LPMediumBin := @MediumBlockBins[LNumaNode, LBinNumber];
       {Get the result}
       Result := LPMediumBin.NextFreeBlock;
 {$ifdef CheckHeapForCorruption}
@@ -4997,7 +4761,7 @@ begin
       end;
 {$endif}
       {Remove the block from the bin containing it}
-      RemoveMediumFreeBlock(Result);
+      RemoveMediumFreeBlock(LNumaNode, Result);
       {Get the block size}
       LAvailableBlockSize := PNativeUInt(PByte(Result) - BlockHeaderSize)^ and DropMediumAndLargeFlagsMask;
 {$ifndef FullDebugMode}
@@ -5013,7 +4777,7 @@ begin
         PNativeUInt(PByte(LSecondSplit) + LSecondSplitSize - 2 * BlockHeaderSize)^ := LSecondSplitSize;
         {Put the remainder in a bin if it is big enough}
         if LSecondSplitSize >= MinimumMediumBlockSize then
-          InsertMediumBlockIntoBin(LSecondSplit, LSecondSplitSize);
+          InsertMediumBlockIntoBin(LNumaNode, LSecondSplit, LSecondSplitSize);
       end
       else
       begin
@@ -5045,7 +4809,7 @@ begin
       Dec(PNativeUInt(PByte(Result) - BlockHeaderSize)^, IsFreeBlockFlag);
 {$endif}
       {Unlock the medium blocks}
-      MediumBlocksLocked := False;
+      MediumBlocksLocked[LNumaNode] := False;
     end
     else
     begin
@@ -5092,18 +4856,20 @@ var
   LDelayRelease: Boolean;
   LPReleaseStack: ^TLFStack;
 {$endif}
+  LNumaNode: integer;
 begin
   {Get the block header}
   LBlockHeader := PNativeUInt(PByte(APointer) - BlockHeaderSize)^;
   {Get the medium block size}
   LBlockSize := LBlockHeader and DropMediumAndLargeFlagsMask;
   {When running a cleanup operation, medium blocks are already locked.}
+  LNumaNode := PBlockHeader(PByte(APointer) - BlockHeaderSize)^.NumaNode;
 {$ifdef UseReleaseStack}
   if not ACleanupOperation then
   begin
 {$endif}
     {Lock the medium blocks}
-    LockMediumBlocks(
+    LockMediumBlocks(LNumaNode,
       {$ifdef LogLockContention}LDidSleep{$ifdef UseReleaseStack},{$endif}{$endif}
       {$ifdef UseReleaseStack}APointer, @LDelayRelease{$endif});
 {$ifdef UseReleaseStack}
@@ -5149,7 +4915,7 @@ begin
       Inc(LBlockSize, LNextMediumBlockSizeAndFlags and DropMediumAndLargeFlagsMask);
       {Remove the next block as well}
       if LNextMediumBlockSizeAndFlags >= MinimumMediumBlockSize then
-        RemoveMediumFreeBlock(LNextMediumBlock);
+        RemoveMediumFreeBlock(LNumaNode, LNextMediumBlock);
     end
     else
     begin
@@ -5182,7 +4948,7 @@ begin
       APointer := LPreviousMediumBlock;
       {Remove the previous block from the linked list}
       if LPreviousMediumBlockSize >= MinimumMediumBlockSize then
-        RemoveMediumFreeBlock(LPreviousMediumBlock);
+        RemoveMediumFreeBlock(LNumaNode, LPreviousMediumBlock);
     end;
 {$ifdef CheckHeapForCorruption}
     {Check that the previous block is currently flagged as in use}
@@ -5209,7 +4975,7 @@ begin
       {Insert this block back into the bins: Size check not required here,
        since medium blocks that are in use are not allowed to be
        shrunk smaller than MinimumMediumBlockSize}
-      InsertMediumBlockIntoBin(APointer, LBlockSize);
+      InsertMediumBlockIntoBin(LNumaNode, APointer, LBlockSize);
 {$ifndef FullDebugMode}
 {$ifdef CheckHeapForCorruption}
       {Check that this block is actually free and the next and previous blocks are both in use.}
@@ -5235,20 +5001,20 @@ begin
     else
     begin
       {Should this become the new sequential feed?}
-      if MediumSequentialFeedBytesLeft <> MediumBlockPoolSize - MediumBlockPoolHeaderSize then
+      if MediumSequentialFeedBytesLeft[LNumaNode] <> MediumBlockPoolSize - MediumBlockPoolHeaderSize then
       begin
         {Bin the current sequential feed}
-        BinMediumSequentialFeedRemainder;
+        BinMediumSequentialFeedRemainder(LNumaNode);
         {Set this medium pool up as the new sequential feed pool:
          Store the sequential feed pool trailer}
         PNativeUInt(PByte(APointer) + LBlockSize - BlockHeaderSize)^ := IsMediumBlockFlag;
         {Store the number of bytes available in the sequential feed chunk}
-        MediumSequentialFeedBytesLeft := MediumBlockPoolSize - MediumBlockPoolHeaderSize;
+        MediumSequentialFeedBytesLeft[LNumaNode] := MediumBlockPoolSize - MediumBlockPoolHeaderSize;
         {Set the last sequentially fed block}
-        LastSequentiallyFedMediumBlock := Pointer(PByte(APointer) + LBlockSize);
+        LastSequentiallyFedMediumBlock[LNumaNode] := Pointer(PByte(APointer) + LBlockSize);
 {$ifndef UseReleaseStack}
         {Unlock medium blocks}
-        MediumBlocksLocked := False;
+        MediumBlocksLocked[LNumaNode] := False;
 {$endif}
         {Success}
         Result := 0;
@@ -5262,7 +5028,7 @@ begin
         LPPreviousMediumBlockPoolHeader.NextMediumBlockPoolHeader := LPNextMediumBlockPoolHeader;
         LPNextMediumBlockPoolHeader.PreviousMediumBlockPoolHeader := LPPreviousMediumBlockPoolHeader;
         {Unlock medium blocks}
-        MediumBlocksLocked := False;
+        MediumBlocksLocked[LNumaNode] := False;
 {$ifdef ClearMediumBlockPoolsBeforeReturningToOS}
         FillChar(APointer^, MediumBlockPoolSize, 0);
 {$endif}
@@ -5281,13 +5047,13 @@ begin
 {$ifdef UseReleaseStack}
     if (Result <> 0) or ACleanupOperation then
     begin
-      MediumBlocksLocked := False;
+      MediumBlocksLocked[LNumaNode] := False;
       Break;
     end;
     LPReleaseStack := @MediumReleaseStack[GetStackSlot];
     if LPReleaseStack^.IsEmpty or (not LPReleaseStack.Pop(APointer)) then
     begin
-      MediumBlocksLocked := False;
+      MediumBlocksLocked[LNumaNode] := False;
       Break;
     end;
     {Get the block header}
@@ -5478,6 +5244,7 @@ var
 {$ifdef LogLockContention}
   LCollector: PStaticCollector;
 {$endif}
+  LNumaNode: integer;
 
   {Upsizes a large block in-place. The following variables are assumed correct:
     LBlockFlags, LOldAvailableSize, LPNextBlock, LNextBlockSizeAndFlags,
@@ -5487,7 +5254,7 @@ var
   begin
     {Remove the next block}
     if LNextBlockSizeAndFlags >= MinimumMediumBlockSize then
-      RemoveMediumFreeBlock(LPNextBlock);
+      RemoveMediumFreeBlock(LNumaNode, LPNextBlock);
     {Add 25% for medium block in-place upsizes}
     LMinimumUpsize := LOldAvailableSize + (LOldAvailableSize shr 2);
     if NativeUInt(ANewSize) < LMinimumUpsize then
@@ -5519,7 +5286,7 @@ var
       PNativeUInt(PByte(LPNextBlock) + LSecondSplitSize - 2 * BlockHeaderSize)^ := LSecondSplitSize;
       {Put the remainder in a bin if it is big enough}
       if LSecondSplitSize >= MinimumMediumBlockSize then
-        InsertMediumBlockIntoBin(LPNextBlock, LSecondSplitSize);
+        InsertMediumBlockIntoBin(LNumaNode, LPNextBlock, LSecondSplitSize);
     end;
     {Set the size and flags for this block}
     PNativeUInt(PByte(APointer) - BlockHeaderSize)^ := LNewBlockSize or LBlockFlags;
@@ -5539,7 +5306,7 @@ var
     {Get the size of the second split}
     LSecondSplitSize := (LOldAvailableSize + BlockHeaderSize) - LNewBlockSize;
     {Lock the medium blocks}
-    LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
+    LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
 {$ifdef LogLockContention}
     if LDidSleep then
       LCollector := @MediumBlockCollector;
@@ -5563,7 +5330,7 @@ var
       LNextBlockSizeAndFlags := LNextBlockSizeAndFlags and DropMediumAndLargeFlagsMask;
       Inc(LSecondSplitSize, LNextBlockSizeAndFlags);
       if LNextBlockSizeAndFlags >= MinimumMediumBlockSize then
-        RemoveMediumFreeBlock(LPNextBlock);
+        RemoveMediumFreeBlock(LNumaNode, LPNextBlock);
     end;
     {Set the split}
     LPNextBlock := PNativeUInt(PByte(APointer) + LNewBlockSize);
@@ -5573,9 +5340,9 @@ var
     PNativeUInt(PByte(LPNextBlock) + LSecondSplitSize - 2 * BlockHeaderSize)^ := LSecondSplitSize;
     {Bin this free block}
     if LSecondSplitSize >= MinimumMediumBlockSize then
-      InsertMediumBlockIntoBin(LPNextBlock, LSecondSplitSize);
+      InsertMediumBlockIntoBin(LNumaNode, LPNextBlock, LSecondSplitSize);
     {Unlock the medium blocks}
-    MediumBlocksLocked := False;
+    MediumBlocksLocked[LNumaNode] := False;
   end;
 
 {$ifdef LogLockContention}
@@ -5601,6 +5368,7 @@ begin
     Exit;
   end;
 {$endif}
+  LNumaNode := GetThreadNUMANode;
 {$ifdef LogLockContention}
   LCollector := nil;
   try
@@ -5710,7 +5478,7 @@ begin
              block in place.}
             {Multi-threaded application - lock medium blocks and re-read the
              information on the blocks.}
-             LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
+             LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
 {$ifdef LogLockContention}
              if LDidSleep then
                LCollector := @MediumBlockCollector;
@@ -5730,14 +5498,14 @@ begin
               {Upsize the block in-place}
               MediumBlockInPlaceUpsize;
               {Unlock the medium blocks}
-              MediumBlocksLocked := False;
+              MediumBlocksLocked[LNumaNode] := False;
               {Return the result}
               Result := APointer;
               {Done}
               Exit;
             end;
             {Couldn't use the block: Unlock the medium blocks}
-            MediumBlocksLocked := False;
+            MediumBlocksLocked[LNumaNode] := False;
           end;
         end;
         {Couldn't upsize in place. Grab a new block and move the data across:
@@ -8091,65 +7859,70 @@ var
   LBlockSize: NativeInt;
   LPSmallBlockPool: PSmallBlockPoolHeader;
   LCurPtr, LEndPtr: Pointer;
-  LInd: Integer;
 {$ifdef LogLockContention}
   LDidSleep: Boolean;
 {$endif}
+  LNumaNode: integer;
 begin
   {Lock all small block types}
   LockAllSmallBlockTypes;
-  {Lock the medium blocks}
-  LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
   try
-    {Step through all the medium block pools}
-    LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
-    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    {Step through all NUMA nodes}
+    for LNumaNode := 0 to CMaxNumaNodes - 1 do
     begin
-      LPMediumBlock := GetFirstMediumBlockInPool(LPMediumBlockPoolHeader);
-      while LPMediumBlock <> nil do
-      begin
-        LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
-        {Is the block in use?}
-        if LMediumBlockHeader and IsFreeBlockFlag = 0 then
+      {Lock the medium blocks}
+      LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
+      try
+        {Step through all the medium block pools}
+        LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
+        while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
         begin
-          if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
+          LPMediumBlock := GetFirstMediumBlockInPool(LNumaNode, LPMediumBlockPoolHeader);
+          while LPMediumBlock <> nil do
           begin
-            {Step through all the blocks in the small block pool}
-            LPSmallBlockPool := LPMediumBlock;
-            {Get the useable size inside a block}
-            LBlockSize := LPSmallBlockPool.BlockType.BlockSize - BlockHeaderSize - TotalDebugOverhead;
-            {Get the first and last pointer for the pool}
-            GetFirstAndLastSmallBlockInPool(LPSmallBlockPool, LCurPtr, LEndPtr);
-            {Step through all blocks}
-            while UIntPtr(LCurPtr) <= UIntPtr(LEndPtr) do
+            LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
+            {Is the block in use?}
+            if LMediumBlockHeader and IsFreeBlockFlag = 0 then
             begin
-              {Is this block in use?}
-              if (PNativeUInt(PByte(LCurPtr) - BlockHeaderSize)^ and IsFreeBlockFlag) = 0 then
+              if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
               begin
-                ACallBack(PByte(LCurPtr) + DebugHeaderSize, LBlockSize, AUserData);
+                {Step through all the blocks in the small block pool}
+                LPSmallBlockPool := LPMediumBlock;
+                {Get the useable size inside a block}
+                LBlockSize := LPSmallBlockPool.BlockType.BlockSize - BlockHeaderSize - TotalDebugOverhead;
+                {Get the first and last pointer for the pool}
+                GetFirstAndLastSmallBlockInPool(LPSmallBlockPool, LCurPtr, LEndPtr);
+                {Step through all blocks}
+                while UIntPtr(LCurPtr) <= UIntPtr(LEndPtr) do
+                begin
+                  {Is this block in use?}
+                  if (PNativeUInt(PByte(LCurPtr) - BlockHeaderSize)^ and IsFreeBlockFlag) = 0 then
+                  begin
+                    ACallBack(PByte(LCurPtr) + DebugHeaderSize, LBlockSize, AUserData);
+                  end;
+                  {Next block}
+                  Inc(PByte(LCurPtr), LPSmallBlockPool.BlockType.BlockSize);
+                end;
+              end
+              else
+              begin
+                LBlockSize := (LMediumBlockHeader and DropMediumAndLargeFlagsMask) - BlockHeaderSize - TotalDebugOverhead;
+                ACallBack(PByte(LPMediumBlock) + DebugHeaderSize, LBlockSize, AUserData);
               end;
-              {Next block}
-              Inc(PByte(LCurPtr), LPSmallBlockPool.BlockType.BlockSize);
             end;
-          end
-          else
-          begin
-            LBlockSize := (LMediumBlockHeader and DropMediumAndLargeFlagsMask) - BlockHeaderSize - TotalDebugOverhead;
-            ACallBack(PByte(LPMediumBlock) + DebugHeaderSize, LBlockSize, AUserData);
+            {Next medium block}
+            LPMediumBlock := NextMediumBlock(LPMediumBlock);
           end;
+          {Get the next medium block pool}
+          LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
         end;
-        {Next medium block}
-        LPMediumBlock := NextMediumBlock(LPMediumBlock);
+      finally
+        {Unlock medium blocks}
+        MediumBlocksLocked[LNumaNode] := False;
       end;
-      {Get the next medium block pool}
-      LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
     end;
   finally
-    {Unlock medium blocks}
-    MediumBlocksLocked := False;
-    {Unlock all the small block types}
-    for LInd := 0 to NumSmallBlockTypes - 1 do
-      SmallBlockTypes[LInd].BlockTypeLocked := False;
+    UnlockAllSmallBlockTypes;
   end;
   {Step through all the large blocks}
   LockLargeBlocks({$ifdef LogLockContention}LDidSleep{$endif});
@@ -8638,7 +8411,7 @@ var
     Dec(LSmallBlockSize, FullDebugBlockOverhead);
   {$endif}
     {Get the block type index}
-    LBlockTypeIndex := (UIntPtr(APSmallBlockPool.BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
+    LBlockTypeIndex := (UIntPtr(APSmallBlockPool.BlockType) - UIntPtr(@SmallBlockTypes[APSmallBlockPool.NumaNode])) div SizeOf(TSmallBlockType);
     LPLeakedClasses := @LSmallBlockLeaks[LBlockTypeIndex];
     {Get the first and last pointer for the pool}
     GetFirstAndLastSmallBlockInPool(APSmallBlockPool, LCurPtr, LEndPtr);
@@ -8760,6 +8533,9 @@ var
   end;
 {$endif}
 
+var
+  LNumaNode: integer;
+
 begin
 {$ifdef EnableMemoryLeakReporting}
   {Clear the leak arrays}
@@ -8770,72 +8546,76 @@ begin
   {No unexpected leaks so far}
   LExpectedLeaksOnly := True;
 {$endif}
-  {Step through all the medium block pools}
-  LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
-  while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+  {Step through all the NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    LPMediumBlock := GetFirstMediumBlockInPool(LPMediumBlockPoolHeader);
-    while LPMediumBlock <> nil do
+    {Step through all the medium block pools}
+    LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
     begin
-      LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
-      {Is the block in use?}
-      if LMediumBlockHeader and IsFreeBlockFlag = 0 then
+      LPMediumBlock := GetFirstMediumBlockInPool(LNumaNode, LPMediumBlockPoolHeader);
+      while LPMediumBlock <> nil do
       begin
-{$ifdef EnableMemoryLeakReporting}
-        if ACheckForLeakedBlocks then
+        LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
+        {Is the block in use?}
+        if LMediumBlockHeader and IsFreeBlockFlag = 0 then
         begin
-          if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
+  {$ifdef EnableMemoryLeakReporting}
+          if ACheckForLeakedBlocks then
           begin
-            {Get all the leaks for the small block pool}
-            CheckSmallBlockPoolForLeaks(LPMediumBlock);
-          end
-          else
-          begin
-            if (LNumMediumAndLargeLeaks < Length(LMediumAndLargeBlockLeaks))
-  {$ifdef FullDebugMode}
-              and CheckBlockBeforeFreeOrRealloc(LPMediumBlock, boBlockCheck)
-  {$endif}
-            then
+            if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
             begin
-              LMediumBlockSize := (LMediumBlockHeader and DropMediumAndLargeFlagsMask) - BlockHeaderSize;
-  {$ifdef FullDebugMode}
-              Dec(LMediumBlockSize, FullDebugBlockOverhead);
-  {$endif}
-              {Get the leak type}
-              LLeakType := GetMemoryLeakType(LPMediumBlock, LMediumBlockSize);
-              {Is it an expected leak?}
-              LExpectedLeaksOnly := LExpectedLeaksOnly and (LLeakType <> mltUnexpectedLeak);
-  {$ifdef LogMemoryLeakDetailToFile}
-    {$ifdef HideExpectedLeaksRegisteredByPointer}
-              if LLeakType <> mltExpectedLeakRegisteredByPointer then
+              {Get all the leaks for the small block pool}
+              CheckSmallBlockPoolForLeaks(LPMediumBlock);
+            end
+            else
+            begin
+              if (LNumMediumAndLargeLeaks < Length(LMediumAndLargeBlockLeaks))
+    {$ifdef FullDebugMode}
+                and CheckBlockBeforeFreeOrRealloc(LPMediumBlock, boBlockCheck)
     {$endif}
-                LogMemoryLeakOrAllocatedBlock(LPMediumBlock, True);
-  {$endif}
-  {$ifdef HideExpectedLeaksRegisteredByPointer}
-              if LLeakType <> mltExpectedLeakRegisteredByPointer then
-  {$endif}
+              then
               begin
-                {Add the leak to the list}
-                LMediumAndLargeBlockLeaks[LNumMediumAndLargeLeaks] := LMediumBlockSize;
-                Inc(LNumMediumAndLargeLeaks);
+                LMediumBlockSize := (LMediumBlockHeader and DropMediumAndLargeFlagsMask) - BlockHeaderSize;
+    {$ifdef FullDebugMode}
+                Dec(LMediumBlockSize, FullDebugBlockOverhead);
+    {$endif}
+                {Get the leak type}
+                LLeakType := GetMemoryLeakType(LPMediumBlock, LMediumBlockSize);
+                {Is it an expected leak?}
+                LExpectedLeaksOnly := LExpectedLeaksOnly and (LLeakType <> mltUnexpectedLeak);
+    {$ifdef LogMemoryLeakDetailToFile}
+      {$ifdef HideExpectedLeaksRegisteredByPointer}
+                if LLeakType <> mltExpectedLeakRegisteredByPointer then
+      {$endif}
+                  LogMemoryLeakOrAllocatedBlock(LPMediumBlock, True);
+    {$endif}
+    {$ifdef HideExpectedLeaksRegisteredByPointer}
+                if LLeakType <> mltExpectedLeakRegisteredByPointer then
+    {$endif}
+                begin
+                  {Add the leak to the list}
+                  LMediumAndLargeBlockLeaks[LNumMediumAndLargeLeaks] := LMediumBlockSize;
+                  Inc(LNumMediumAndLargeLeaks);
+                end;
               end;
             end;
           end;
+  {$endif}
+        end
+        else
+        begin
+  {$ifdef CheckUseOfFreedBlocksOnShutdown}
+          {Check that the block has not been modified since being freed}
+          CheckFreeBlockUnmodified(LPMediumBlock, LMediumBlockHeader and DropMediumAndLargeFlagsMask, boBlockCheck);
+  {$endif}
         end;
-{$endif}
-      end
-      else
-      begin
-{$ifdef CheckUseOfFreedBlocksOnShutdown}
-        {Check that the block has not been modified since being freed}
-        CheckFreeBlockUnmodified(LPMediumBlock, LMediumBlockHeader and DropMediumAndLargeFlagsMask, boBlockCheck);
-{$endif}
+        {Next medium block}
+        LPMediumBlock := NextMediumBlock(LPMediumBlock);
       end;
-      {Next medium block}
-      LPMediumBlock := NextMediumBlock(LPMediumBlock);
+      {Get the next medium block pool}
+      LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
     end;
-    {Get the next medium block pool}
-    LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
   end;
 {$ifdef EnableMemoryLeakReporting}
   if ACheckForLeakedBlocks then
@@ -8884,108 +8664,112 @@ begin
       LPreviousBlockSize := 0;
       {Set up the leak message header so long}
       LMsgPtr := AppendStringToBuffer(LeakMessageHeader, @LLeakMessage[0], length(LeakMessageHeader));
-      {Step through all the small block types}
-      for LBlockTypeInd := 0 to NumSmallBlockTypes - 1 do
+      {Step through all the NUMA nodes}
+      for LNumaNode := 0 to CMaxNumaNodes - 1 do
       begin
-        LThisBlockSize := SmallBlockTypes[LBlockTypeInd].BlockSize - BlockHeaderSize;
-  {$ifdef FullDebugMode}
-        Dec(LThisBlockSize, FullDebugBlockOverhead);
-        if NativeInt(LThisBlockSize) < 0 then
-          LThisBlockSize := 0;
-  {$endif}
-        LBlockSizeHeaderAdded := False;
-        {Any leaks?}
-        for LClassInd := High(LSmallBlockLeaks[LBlockTypeInd]) downto 0 do
+        {Step through all the small block types}
+        for LBlockTypeInd := 0 to NumSmallBlockTypes - 1 do
         begin
-          {Is there still space in the message buffer? Reserve space for the message
-           footer.}
-          if LMsgPtr > @LLeakMessage[High(LLeakMessage) - 2048] then
-            Break;
-          {Check the count}
-          if LSmallBlockLeaks[LBlockTypeInd][LClassInd].NumLeaks > 0 then
+          LThisBlockSize := SmallBlockTypes[LNumaNode, LBlockTypeInd].BlockSize - BlockHeaderSize;
+    {$ifdef FullDebugMode}
+          Dec(LThisBlockSize, FullDebugBlockOverhead);
+          if NativeInt(LThisBlockSize) < 0 then
+            LThisBlockSize := 0;
+    {$endif}
+          LBlockSizeHeaderAdded := False;
+          {Any leaks?}
+          for LClassInd := High(LSmallBlockLeaks[LBlockTypeInd]) downto 0 do
           begin
-            {Need to add the header?}
-            if not LSmallLeakHeaderAdded then
+            {Is there still space in the message buffer? Reserve space for the message
+             footer.}
+            if LMsgPtr > @LLeakMessage[High(LLeakMessage) - 2048] then
+              Break;
+            {Check the count}
+            if LSmallBlockLeaks[LBlockTypeInd][LClassInd].NumLeaks > 0 then
             begin
-              LMsgPtr := AppendStringToBuffer(SmallLeakDetail, LMsgPtr, Length(SmallLeakDetail));
-              LSmallLeakHeaderAdded := True;
-            end;
-            {Need to add the size header?}
-            if not LBlockSizeHeaderAdded then
-            begin
-              LMsgPtr^ := #13;
-              Inc(LMsgPtr);
-              LMsgPtr^ := #10;
-              Inc(LMsgPtr);
-              LMsgPtr := NativeUIntToStrBuf(LPreviousBlockSize + 1, LMsgPtr);
-              LMsgPtr^ := ' ';
-              Inc(LMsgPtr);
-              LMsgPtr^ := '-';
-              Inc(LMsgPtr);
-              LMsgPtr^ := ' ';
-              Inc(LMsgPtr);
-              LMsgPtr := NativeUIntToStrBuf(LThisBlockSize, LMsgPtr);
-              LMsgPtr := AppendStringToBuffer(BytesMessage, LMsgPtr, Length(BytesMessage));
-              LBlockSizeHeaderAdded := True;
-            end
-            else
-            begin
-              LMsgPtr^ := ',';
-              Inc(LMsgPtr);
-              LMsgPtr^ := ' ';
-              Inc(LMsgPtr);
-            end;
-            {Show the count}
-            case LClassInd of
-              {Unknown}
-              0:
+              {Need to add the header?}
+              if not LSmallLeakHeaderAdded then
               begin
-                LMsgPtr := AppendStringToBuffer(UnknownClassNameMsg, LMsgPtr, Length(UnknownClassNameMsg));
+                LMsgPtr := AppendStringToBuffer(SmallLeakDetail, LMsgPtr, Length(SmallLeakDetail));
+                LSmallLeakHeaderAdded := True;
               end;
-              {AnsiString}
-              1:
+              {Need to add the size header?}
+              if not LBlockSizeHeaderAdded then
               begin
-                LMsgPtr := AppendStringToBuffer(AnsiStringBlockMessage, LMsgPtr, Length(AnsiStringBlockMessage));
+                LMsgPtr^ := #13;
+                Inc(LMsgPtr);
+                LMsgPtr^ := #10;
+                Inc(LMsgPtr);
+                LMsgPtr := NativeUIntToStrBuf(LPreviousBlockSize + 1, LMsgPtr);
+                LMsgPtr^ := ' ';
+                Inc(LMsgPtr);
+                LMsgPtr^ := '-';
+                Inc(LMsgPtr);
+                LMsgPtr^ := ' ';
+                Inc(LMsgPtr);
+                LMsgPtr := NativeUIntToStrBuf(LThisBlockSize, LMsgPtr);
+                LMsgPtr := AppendStringToBuffer(BytesMessage, LMsgPtr, Length(BytesMessage));
+                LBlockSizeHeaderAdded := True;
+              end
+              else
+              begin
+                LMsgPtr^ := ',';
+                Inc(LMsgPtr);
+                LMsgPtr^ := ' ';
+                Inc(LMsgPtr);
               end;
-              {UnicodeString}
-              2:
-              begin
-                LMsgPtr := AppendStringToBuffer(UnicodeStringBlockMessage, LMsgPtr, Length(UnicodeStringBlockMessage));
-              end;
-              {Classes}
-            else
-              begin
-                {$ifdef CheckCppObjectTypeEnabled}
-                if LSmallBlockLeaks[LBlockTypeInd][LClassInd].CppTypeIdPtr <> nil then
+              {Show the count}
+              case LClassInd of
+                {Unknown}
+                0:
                 begin
-                  if Assigned(GetCppVirtObjTypeNameByTypeIdPtrFunc) then
+                  LMsgPtr := AppendStringToBuffer(UnknownClassNameMsg, LMsgPtr, Length(UnknownClassNameMsg));
+                end;
+                {AnsiString}
+                1:
+                begin
+                  LMsgPtr := AppendStringToBuffer(AnsiStringBlockMessage, LMsgPtr, Length(AnsiStringBlockMessage));
+                end;
+                {UnicodeString}
+                2:
+                begin
+                  LMsgPtr := AppendStringToBuffer(UnicodeStringBlockMessage, LMsgPtr, Length(UnicodeStringBlockMessage));
+                end;
+                {Classes}
+              else
+                begin
+                  {$ifdef CheckCppObjectTypeEnabled}
+                  if LSmallBlockLeaks[LBlockTypeInd][LClassInd].CppTypeIdPtr <> nil then
                   begin
-                    LCppTypeName := GetCppVirtObjTypeNameByTypeIdPtrFunc(LSmallBlockLeaks[LBlockTypeInd][LClassInd].CppTypeIdPtr);
-                    LMsgPtr := AppendStringToBuffer(LCppTypeName, LMsgPtr, StrLen(LCppTypeName));
+                    if Assigned(GetCppVirtObjTypeNameByTypeIdPtrFunc) then
+                    begin
+                      LCppTypeName := GetCppVirtObjTypeNameByTypeIdPtrFunc(LSmallBlockLeaks[LBlockTypeInd][LClassInd].CppTypeIdPtr);
+                      LMsgPtr := AppendStringToBuffer(LCppTypeName, LMsgPtr, StrLen(LCppTypeName));
+                    end
+                    else
+                      LMsgPtr := AppendClassNameToBuffer(nil, LMsgPtr);
                   end
                   else
-                    LMsgPtr := AppendClassNameToBuffer(nil, LMsgPtr);
-                end
-                else
-                begin
-                {$endif}
-                  LMsgPtr := AppendClassNameToBuffer(LSmallBlockLeaks[LBlockTypeInd][LClassInd].ClassPointer, LMsgPtr);
-                {$ifdef CheckCppObjectTypeEnabled}
+                  begin
+                  {$endif}
+                    LMsgPtr := AppendClassNameToBuffer(LSmallBlockLeaks[LBlockTypeInd][LClassInd].ClassPointer, LMsgPtr);
+                  {$ifdef CheckCppObjectTypeEnabled}
+                  end;
+                  {$endif}
                 end;
-                {$endif}
               end;
+              {Add the count}
+              LMsgPtr^ := ' ';
+              Inc(LMsgPtr);
+              LMsgPtr^ := 'x';
+              Inc(LMsgPtr);
+              LMsgPtr^ := ' ';
+              Inc(LMsgPtr);
+              LMsgPtr := NativeUIntToStrBuf(LSmallBlockLeaks[LBlockTypeInd][LClassInd].NumLeaks, LMsgPtr);
             end;
-            {Add the count}
-            LMsgPtr^ := ' ';
-            Inc(LMsgPtr);
-            LMsgPtr^ := 'x';
-            Inc(LMsgPtr);
-            LMsgPtr^ := ' ';
-            Inc(LMsgPtr);
-            LMsgPtr := NativeUIntToStrBuf(LSmallBlockLeaks[LBlockTypeInd][LClassInd].NumLeaks, LMsgPtr);
           end;
+          LPreviousBlockSize := LThisBlockSize;
         end;
-        LPreviousBlockSize := LThisBlockSize;
       end;
       {Add the medium/large block leak message}
       if LNumMediumAndLargeLeaks > 0 then
@@ -9055,70 +8839,84 @@ var
 {$ifdef LogLockContention}
   LDidSleep: Boolean;
 {$endif}
+  LNumaNode: Integer;
+  LUseableBlockSize: Integer;
 begin
   {Clear the structure}
   FillChar(AMemoryManagerState, SizeOf(AMemoryManagerState), 0);
-  {Set the small block size stats}
-  for LInd := 0 to NumSmallBlockTypes - 1 do
-  begin
-    AMemoryManagerState.SmallBlockTypeStates[LInd].InternalBlockSize :=
-      SmallBlockTypes[LInd].BlockSize;
-    AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize :=
-      SmallBlockTypes[LInd].BlockSize - BlockHeaderSize{$ifdef FullDebugMode} - FullDebugBlockOverhead{$endif};
-    if NativeInt(AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize) < 0 then
-      AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize := 0;
-  end;
   {Lock all small block types}
   LockAllSmallBlockTypes;
-  {Lock the medium blocks}
-  LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
-  {Step through all the medium block pools}
-  LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
-  while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+  {Step through all the NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    {Add to the medium block used space}
-    Inc(AMemoryManagerState.ReservedMediumBlockAddressSpace, MediumBlockPoolSize);
-    LPMediumBlock := GetFirstMediumBlockInPool(LPMediumBlockPoolHeader);
-    while LPMediumBlock <> nil do
+    {Set the small block size stats}
+    for LInd := 1 to NumSmallBlockTypes - 1 do
     begin
-      LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
-      {Is the block in use?}
-      if LMediumBlockHeader and IsFreeBlockFlag = 0 then
-      begin
-        {Get the block size}
-        LMediumBlockSize := LMediumBlockHeader and DropMediumAndLargeFlagsMask;
-        if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
-        begin
-          {Get the block type index}
-          LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
-          {Subtract from medium block usage}
-          Dec(AMemoryManagerState.ReservedMediumBlockAddressSpace, LMediumBlockSize);
-          {Add it to the reserved space for the block size}
-          Inc(AMemoryManagerState.SmallBlockTypeStates[LBlockTypeIndex].ReservedAddressSpace, LMediumBlockSize);
-          {Add the usage for the pool}
-          Inc(AMemoryManagerState.SmallBlockTypeStates[LBlockTypeIndex].AllocatedBlockCount,
-            PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse);
-        end
-        else
-        begin
-{$ifdef FullDebugMode}
-          Dec(LMediumBlockSize, FullDebugBlockOverhead);
-{$endif}
-          Inc(AMemoryManagerState.AllocatedMediumBlockCount);
-          Inc(AMemoryManagerState.TotalAllocatedMediumBlockSize, LMediumBlockSize - BlockHeaderSize);
-        end;
-      end;
-      {Next medium block}
-      LPMediumBlock := NextMediumBlock(LPMediumBlock);
+      AMemoryManagerState.SmallBlockTypeStates[LInd].InternalBlockSize :=
+        SmallBlockTypes[0, LInd].BlockSize;
+      AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize :=
+        SmallBlockTypes[0, LInd].BlockSize - BlockHeaderSize{$ifdef FullDebugMode} - FullDebugBlockOverhead{$endif};
+      if NativeInt(AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize) < 0 then
+        AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize := 0;
     end;
-    {Get the next medium block pool}
-    LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
+    for LInd := 1 to NumSmallBlockTypes - 1 do
+    begin
+      Inc(AMemoryManagerState.SmallBlockTypeStates[LInd].InternalBlockSize,
+        SmallBlockTypes[LNumaNode, LInd].BlockSize);
+      LUseableBlockSize := SmallBlockTypes[LNumaNode, LInd].BlockSize - BlockHeaderSize{$ifdef FullDebugMode} - FullDebugBlockOverhead{$endif};
+      if LUseableBlockSize > 0 then
+        Inc(AMemoryManagerState.SmallBlockTypeStates[LInd].UseableBlockSize,
+            LUseableBlockSize);
+    end;
+    {Lock the medium blocks}
+    LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
+    {Step through all the medium block pools}
+    LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    begin
+      {Add to the medium block used space}
+      Inc(AMemoryManagerState.ReservedMediumBlockAddressSpace, MediumBlockPoolSize);
+      LPMediumBlock := GetFirstMediumBlockInPool(LNumaNode, LPMediumBlockPoolHeader);
+      while LPMediumBlock <> nil do
+      begin
+        LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
+        {Is the block in use?}
+        if LMediumBlockHeader and IsFreeBlockFlag = 0 then
+        begin
+          {Get the block size}
+          LMediumBlockSize := LMediumBlockHeader and DropMediumAndLargeFlagsMask;
+          if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
+          begin
+            {Get the block type index}
+            LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[PSmallBlockPoolHeader(LPMediumBlock).NumaNode])) div SizeOf(TSmallBlockType);
+            {Subtract from medium block usage}
+            Dec(AMemoryManagerState.ReservedMediumBlockAddressSpace, LMediumBlockSize);
+            {Add it to the reserved space for the block size}
+            Inc(AMemoryManagerState.SmallBlockTypeStates[LBlockTypeIndex].ReservedAddressSpace, LMediumBlockSize);
+            {Add the usage for the pool}
+            Inc(AMemoryManagerState.SmallBlockTypeStates[LBlockTypeIndex].AllocatedBlockCount,
+              PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse);
+          end
+          else
+          begin
+  {$ifdef FullDebugMode}
+            Dec(LMediumBlockSize, FullDebugBlockOverhead);
+  {$endif}
+            Inc(AMemoryManagerState.AllocatedMediumBlockCount);
+            Inc(AMemoryManagerState.TotalAllocatedMediumBlockSize, LMediumBlockSize - BlockHeaderSize);
+          end;
+        end;
+        {Next medium block}
+        LPMediumBlock := NextMediumBlock(LPMediumBlock);
+      end;
+      {Get the next medium block pool}
+      LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
+    end;
+    {Unlock medium blocks}
+    MediumBlocksLocked[LNumaNode] := False;
   end;
-  {Unlock medium blocks}
-  MediumBlocksLocked := False;
   {Unlock all the small block types}
-  for LInd := 0 to NumSmallBlockTypes - 1 do
-    SmallBlockTypes[LInd].BlockTypeLocked := False;
+  UnlockAllSmallBlockTypes;
   {Step through all the large blocks}
   LockLargeBlocks({$ifdef LogLockContention}LDidSleep{$endif});
   LPLargeBlock := LargeBlocksCircularList.NextLargeBlockHeader;
@@ -9176,29 +8974,34 @@ var
   LPLargeBlock: PLargeBlockHeader;
   LInd, LChunkIndex, LNextChunk, LLargeBlockSize: NativeUInt;
   LMBI: TMemoryBasicInformation;
+  LNumaNode: Integer;
 {$ifdef LogLockContention}
   LDidSleep: Boolean;
 {$endif}
 begin
   {Clear the map}
   FillChar(AMemoryMap, SizeOf(AMemoryMap), Ord(csUnallocated));
-  {Step through all the medium block pools}
-  LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
-  LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
-  while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+  {Step through all the NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    {Add to the medium block used space}
-    LChunkIndex := NativeUInt(LPMediumBlockPoolHeader) shr 16;
-    for LInd := 0 to (MediumBlockPoolSize - 1) shr 16 do
+    {Step through all the medium block pools}
+    LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
+    LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
     begin
-      if (LChunkIndex + LInd) > High(AMemoryMap) then
-        Break;
-      AMemoryMap[LChunkIndex + LInd] := csAllocated;
+      {Add to the medium block used space}
+      LChunkIndex := NativeUInt(LPMediumBlockPoolHeader) shr 16;
+      for LInd := 0 to (MediumBlockPoolSize - 1) shr 16 do
+      begin
+        if (LChunkIndex + LInd) > High(AMemoryMap) then
+          Break;
+        AMemoryMap[LChunkIndex + LInd] := csAllocated;
+      end;
+      {Get the next medium block pool}
+      LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
     end;
-    {Get the next medium block pool}
-    LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
+    MediumBlocksLocked[LNumaNode] := False;
   end;
-  MediumBlocksLocked := False;
   {Step through all the large blocks}
   LockLargeBlocks({$ifdef LogLockContention}LDidSleep{$endif});
   LPLargeBlock := LargeBlocksCircularList.NextLargeBlockHeader;
@@ -9266,83 +9069,86 @@ var
   LPMediumBlock: Pointer;
   LBlockTypeIndex, LMediumBlockSize: Cardinal;
   LSmallBlockUsage, LSmallBlockOverhead, LMediumBlockHeader, LLargeBlockSize: NativeUInt;
-  LInd: Integer;
   LPLargeBlock: PLargeBlockHeader;
 {$ifdef LogLockContention}
   LDidSleep: Boolean;
 {$endif}
+  LNumaNode: Integer;
 begin
   {Clear the structure}
   FillChar(Result, SizeOf(Result), 0);
   {Lock all small block types}
   LockAllSmallBlockTypes;
-  {Lock the medium blocks}
-  LockMediumBlocks({$ifdef LogLockContention}LDidSleep{$endif});
-  {Step through all the medium block pools}
-  LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
-  while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+  {Step through all the NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    {Add to the total and committed address space}
-    Inc(Result.TotalAddrSpace, ((MediumBlockPoolSize + $ffff) and $ffff0000));
-    Inc(Result.TotalCommitted, ((MediumBlockPoolSize + $ffff) and $ffff0000));
-    {Add the medium block pool overhead}
-    Inc(Result.Overhead, (((MediumBlockPoolSize + $ffff) and $ffff0000)
-      - MediumBlockPoolSize + MediumBlockPoolHeaderSize));
-    {Get the first medium block in the pool}
-    LPMediumBlock := GetFirstMediumBlockInPool(LPMediumBlockPoolHeader);
-    while LPMediumBlock <> nil do
+    {Lock the medium blocks}
+    LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
+    {Step through all the medium block pools}
+    LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
     begin
-      {Get the block header}
-      LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
-      {Get the block size}
-      LMediumBlockSize := LMediumBlockHeader and DropMediumAndLargeFlagsMask;
-      {Is the block in use?}
-      if LMediumBlockHeader and IsFreeBlockFlag = 0 then
+      {Add to the total and committed address space}
+      Inc(Result.TotalAddrSpace, ((MediumBlockPoolSize + $ffff) and $ffff0000));
+      Inc(Result.TotalCommitted, ((MediumBlockPoolSize + $ffff) and $ffff0000));
+      {Add the medium block pool overhead}
+      Inc(Result.Overhead, (((MediumBlockPoolSize + $ffff) and $ffff0000)
+        - MediumBlockPoolSize + MediumBlockPoolHeaderSize));
+      {Get the first medium block in the pool}
+      LPMediumBlock := GetFirstMediumBlockInPool(LNumaNode, LPMediumBlockPoolHeader);
+      while LPMediumBlock <> nil do
       begin
-        if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
+        {Get the block header}
+        LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
+        {Get the block size}
+        LMediumBlockSize := LMediumBlockHeader and DropMediumAndLargeFlagsMask;
+        {Is the block in use?}
+        if LMediumBlockHeader and IsFreeBlockFlag = 0 then
         begin
-          {Get the block type index}
-          LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[0])) div SizeOf(TSmallBlockType);
-          {Get the usage in the block}
-          LSmallBlockUsage := PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse
-            * SmallBlockTypes[LBlockTypeIndex].BlockSize;
-          {Get the total overhead for all the small blocks}
-          LSmallBlockOverhead := PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse
-              * (BlockHeaderSize{$ifdef FullDebugMode} + FullDebugBlockOverhead{$endif});
-          {Add to the totals}
-          Inc(Result.FreeSmall, LMediumBlockSize - LSmallBlockUsage - BlockHeaderSize);
-          Inc(Result.Overhead, LSmallBlockOverhead + BlockHeaderSize);
-          Inc(Result.TotalAllocated, LSmallBlockUsage - LSmallBlockOverhead);
+          if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
+          begin
+            {Get the block type index}
+            LBlockTypeIndex := (UIntPtr(PSmallBlockPoolHeader(LPMediumBlock).BlockType) - UIntPtr(@SmallBlockTypes[PSmallBlockPoolHeader(LPMediumBlock).NumaNode])) div SizeOf(TSmallBlockType);
+            {Get the usage in the block}
+            LSmallBlockUsage := PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse
+              * SmallBlockTypes[0,LBlockTypeIndex].BlockSize;
+            {Get the total overhead for all the small blocks}
+            LSmallBlockOverhead := PSmallBlockPoolHeader(LPMediumBlock).BlocksInUse
+                * (BlockHeaderSize{$ifdef FullDebugMode} + FullDebugBlockOverhead{$endif});
+            {Add to the totals}
+            Inc(Result.FreeSmall, LMediumBlockSize - LSmallBlockUsage - BlockHeaderSize);
+            Inc(Result.Overhead, LSmallBlockOverhead + BlockHeaderSize);
+            Inc(Result.TotalAllocated, LSmallBlockUsage - LSmallBlockOverhead);
+          end
+          else
+          begin
+  {$ifdef FullDebugMode}
+            Dec(LMediumBlockSize, FullDebugBlockOverhead);
+            Inc(Result.Overhead, FullDebugBlockOverhead);
+  {$endif}
+            {Add to the result}
+            Inc(Result.TotalAllocated, LMediumBlockSize - BlockHeaderSize);
+            Inc(Result.Overhead, BlockHeaderSize);
+          end;
         end
         else
         begin
-{$ifdef FullDebugMode}
-          Dec(LMediumBlockSize, FullDebugBlockOverhead);
-          Inc(Result.Overhead, FullDebugBlockOverhead);
-{$endif}
-          {Add to the result}
-          Inc(Result.TotalAllocated, LMediumBlockSize - BlockHeaderSize);
-          Inc(Result.Overhead, BlockHeaderSize);
+          {The medium block is free}
+          Inc(Result.FreeBig, LMediumBlockSize);
         end;
-      end
-      else
-      begin
-        {The medium block is free}
-        Inc(Result.FreeBig, LMediumBlockSize);
+        {Next medium block}
+        LPMediumBlock := NextMediumBlock(LPMediumBlock);
       end;
-      {Next medium block}
-      LPMediumBlock := NextMediumBlock(LPMediumBlock);
+      {Get the next medium block pool}
+      LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
     end;
-    {Get the next medium block pool}
-    LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
+    {Add the sequential feed unused space}
+    Inc(Result.Unused, MediumSequentialFeedBytesLeft[LNumaNode]);
+    {Unlock the medium blocks}
+    MediumBlocksLocked[LNumaNode] := False;
   end;
-  {Add the sequential feed unused space}
-  Inc(Result.Unused, MediumSequentialFeedBytesLeft);
-  {Unlock the medium blocks}
-  MediumBlocksLocked := False;
   {Unlock all the small block types}
-  for LInd := 0 to NumSmallBlockTypes - 1 do
-    SmallBlockTypes[LInd].BlockTypeLocked := False;
+  UnlockAllSmallBlockTypes;
   {Step through all the large blocks}
   LockLargeBlocks({$ifdef LogLockContention}LDidSleep{$endif});
   LPLargeBlock := LargeBlocksCircularList.NextLargeBlockHeader;
@@ -9370,46 +9176,51 @@ var
   LPMediumFreeBlock: PMediumFreeBlock;
   LPLargeBlock, LPNextLargeBlock: PLargeBlockHeader;
   LInd: Integer;
+  LNumaNode: Integer;
 begin
-  {Free all block pools}
-  LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
-  while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+  {Step through all the NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    {Get the next medium block pool so long}
-    LPNextMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
-{$ifdef ClearMediumBlockPoolsBeforeReturningToOS}
-    FillChar(LPMediumBlockPoolHeader^, MediumBlockPoolSize, 0);
-{$else}
-    {$ifdef ClearSmallAndMediumBlocksInFreeMem}
-    FillChar(LPMediumBlockPoolHeader^, MediumBlockPoolSize, 0);
-    {$endif}
-{$endif}
-    {Free this pool}
-    VirtualFree(LPMediumBlockPoolHeader, 0, MEM_RELEASE);
-    {Next pool}
-    LPMediumBlockPoolHeader := LPNextMediumBlockPoolHeader;
+    {Free all block pools}
+    LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    begin
+      {Get the next medium block pool so long}
+      LPNextMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
+  {$ifdef ClearMediumBlockPoolsBeforeReturningToOS}
+      FillChar(LPMediumBlockPoolHeader^, MediumBlockPoolSize, 0);
+  {$else}
+      {$ifdef ClearSmallAndMediumBlocksInFreeMem}
+      FillChar(LPMediumBlockPoolHeader^, MediumBlockPoolSize, 0);
+      {$endif}
+  {$endif}
+      {Free this pool}
+      VirtualFree(LPMediumBlockPoolHeader, 0, MEM_RELEASE);
+      {Next pool}
+      LPMediumBlockPoolHeader := LPNextMediumBlockPoolHeader;
+    end;
+    {Clear all small block types}
+    for LInd := 0 to High(SmallBlockTypes) do
+    begin
+      SmallBlockTypes[LNumaNode, Lind].PreviousPartiallyFreePool := @SmallBlockTypes[LNumaNode, Lind];
+      SmallBlockTypes[LNumaNode, Lind].NextPartiallyFreePool := @SmallBlockTypes[LNumaNode, Lind];
+      SmallBlockTypes[LNumaNode, Lind].NextSequentialFeedBlockAddress := Pointer(1);
+      SmallBlockTypes[LNumaNode, Lind].MaxSequentialFeedBlockAddress := nil;
+    end;
+    {Clear all medium block pools}
+    MediumBlockPoolsCircularList[LNumaNode].PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
+    MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
+    {All medium bins are empty}
+    for LInd := 0 to High(MediumBlockBins[LNumaNode]) do
+    begin
+      LPMediumFreeBlock := @MediumBlockBins[LNumaNode, LInd];
+      LPMediumFreeBlock.PreviousFreeBlock := LPMediumFreeBlock;
+      LPMediumFreeBlock.NextFreeBlock := LPMediumFreeBlock;
+    end;
+    MediumBlockBinGroupBitmap[LNumaNode] := 0;
+    FillChar(MediumBlockBinBitmaps, SizeOf(MediumBlockBinBitmaps), 0);
+    MediumSequentialFeedBytesLeft[LNumaNode] := 0;
   end;
-  {Clear all small block types}
-  for LInd := 0 to High(SmallBlockTypes) do
-  begin
-    SmallBlockTypes[Lind].PreviousPartiallyFreePool := @SmallBlockTypes[Lind];
-    SmallBlockTypes[Lind].NextPartiallyFreePool := @SmallBlockTypes[Lind];
-    SmallBlockTypes[Lind].NextSequentialFeedBlockAddress := Pointer(1);
-    SmallBlockTypes[Lind].MaxSequentialFeedBlockAddress := nil;
-  end;
-  {Clear all medium block pools}
-  MediumBlockPoolsCircularList.PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
-  MediumBlockPoolsCircularList.NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
-  {All medium bins are empty}
-  for LInd := 0 to High(MediumBlockBins) do
-  begin
-    LPMediumFreeBlock := @MediumBlockBins[LInd];
-    LPMediumFreeBlock.PreviousFreeBlock := LPMediumFreeBlock;
-    LPMediumFreeBlock.NextFreeBlock := LPMediumFreeBlock;
-  end;
-  MediumBlockBinGroupBitmap := 0;
-  FillChar(MediumBlockBinBitmaps, SizeOf(MediumBlockBinBitmaps), 0);
-  MediumSequentialFeedBytesLeft := 0;
   {Free all large blocks}
   LPLargeBlock := LargeBlocksCircularList.NextLargeBlockHeader;
   while LPLargeBlock <> @LargeBlocksCircularList do
@@ -9780,7 +9591,14 @@ var
 {$ifdef UseReleaseStack}
   LSlot: Integer;
 {$endif}
+  LNumaNode: Integer;
 begin
+  if not GetNumaHighestNodeNumber(HighNUMANode) then HighNUMANode := 0;
+
+  // TODO 1 -oPrimoz Gabrijelcic : *** TEMPORARY ****
+  if HighNUMANode > CMaxNumaNodes then
+    System.Error(reOutOfMemory);
+
 {$ifdef FullDebugMode}
   {$ifdef LoadDebugDLLDynamically}
   {Attempt to load the FullDebugMode DLL dynamically.}
@@ -9800,86 +9618,92 @@ begin
 {$endif}
   {Initialize the memory manager}
   {-------------Set up the small block types-------------}
-  LPreviousBlockSize := 0;
-  for LInd := 0 to High(SmallBlockTypes) do
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    {Set the move procedure}
-{$ifdef UseCustomFixedSizeMoveRoutines}
-    {The upsize move procedure may move chunks in 16 bytes even with 8-byte
-    alignment, since the new size will always be at least 8 bytes bigger than
-    the old size.}
-    if not Assigned(SmallBlockTypes[LInd].UpsizeMoveProcedure) then
-  {$ifdef UseCustomVariableSizeMoveRoutines}
-      SmallBlockTypes[LInd].UpsizeMoveProcedure := MoveX16LP;
-  {$else}
-      SmallBlockTypes[LInd].UpsizeMoveProcedure := @System.Move;
-  {$endif}
-{$endif}
-{$ifdef LogLockContention}
-    SmallBlockTypes[LInd].BlockCollector.Initialize;
-{$endif}
-    {Set the first "available pool" to the block type itself, so that the
-     allocation routines know that there are currently no pools with free
-     blocks of this size.}
-    SmallBlockTypes[LInd].PreviousPartiallyFreePool := @SmallBlockTypes[LInd];
-    SmallBlockTypes[LInd].NextPartiallyFreePool := @SmallBlockTypes[LInd];
-    {Set the block size to block type index translation table}
-    for LSizeInd := (LPreviousBlockSize div SmallBlockGranularity) to ((SmallBlockTypes[LInd].BlockSize - 1) div SmallBlockGranularity) do
-      AllocSize2SmallBlockTypeIndX4[LSizeInd] := LInd * 4;
-    {Cannot sequential feed yet: Ensure that the next address is greater than
-     the maximum address}
-    SmallBlockTypes[LInd].MaxSequentialFeedBlockAddress := Pointer(0);
-    SmallBlockTypes[LInd].NextSequentialFeedBlockAddress := Pointer(1);
-    {Get the mask to use for finding a medium block suitable for a block pool}
-    LMinimumPoolSize :=
-      ((SmallBlockTypes[LInd].BlockSize * MinimumSmallBlocksPerPool
-        + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
-      and -MediumBlockGranularity) + MediumBlockSizeOffset;
-    if LMinimumPoolSize < MinimumMediumBlockSize then
-      LMinimumPoolSize := MinimumMediumBlockSize;
-    {Get the closest group number for the minimum pool size}
-    LGroupNumber := (LMinimumPoolSize - MinimumMediumBlockSize + MediumBlockBinsPerGroup * MediumBlockGranularity div 2)
-      div (MediumBlockBinsPerGroup * MediumBlockGranularity);
-    {Too large?}
-    if LGroupNumber > 7 then
-      LGroupNumber := 7;
-    {Set the bitmap}
-    SmallBlockTypes[LInd].AllowedGroupsForBlockPoolBitmap := Byte(-(1 shl LGroupNumber));
-    {Set the minimum pool size}
-    SmallBlockTypes[LInd].MinimumBlockPoolSize := MinimumMediumBlockSize + LGroupNumber * (MediumBlockBinsPerGroup * MediumBlockGranularity);
-    {Get the optimal block pool size}
-    LOptimalPoolSize := ((SmallBlockTypes[LInd].BlockSize * TargetSmallBlocksPerPool
-        + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
-      and -MediumBlockGranularity) + MediumBlockSizeOffset;
-    {Limit the optimal pool size to within range}
-    if LOptimalPoolSize < OptimalSmallBlockPoolSizeLowerLimit then
-      LOptimalPoolSize := OptimalSmallBlockPoolSizeLowerLimit;
-    if LOptimalPoolSize > OptimalSmallBlockPoolSizeUpperLimit then
-      LOptimalPoolSize := OptimalSmallBlockPoolSizeUpperLimit;
-    {How many blocks will fit in the adjusted optimal size?}
-    LBlocksPerPool := (LOptimalPoolSize - SmallBlockPoolHeaderSize) div SmallBlockTypes[LInd].BlockSize;
-    {Recalculate the optimal pool size to minimize wastage due to a partial
-     last block.}
-    SmallBlockTypes[LInd].OptimalBlockPoolSize :=
-      ((LBlocksPerPool * SmallBlockTypes[LInd].BlockSize + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset) and -MediumBlockGranularity) + MediumBlockSizeOffset;
-{$ifdef UseReleaseStack}
-    for LSlot := 0 to NumStacksPerBlock - 1 do
-      SmallBlockTypes[LInd].ReleaseStack[LSlot].Initialize(ReleaseStackSize, SizeOf(Pointer));
-{$endif}
-{$ifdef CheckHeapForCorruption}
-    {Debug checks}
-    if (SmallBlockTypes[LInd].OptimalBlockPoolSize < MinimumMediumBlockSize)
-      or (SmallBlockTypes[LInd].BlockSize div SmallBlockGranularity * SmallBlockGranularity <> SmallBlockTypes[LInd].BlockSize) then
+    LPreviousBlockSize := 0;
+    for LInd := 0 to High(SmallBlockTypes[LNumaNode]) do
     begin
-  {$ifdef BCB6OrDelphi7AndUp}
-      System.Error(reInvalidPtr);
-  {$else}
-      System.RunError(reInvalidPtr);
+      SmallBlockTypes[LNumaNode, LInd].BlockSize := CSmallBlockSizes[LInd];
+      {Set the move procedure}
+  {$ifdef UseCustomFixedSizeMoveRoutines}
+      {The upsize move procedure may move chunks in 16 bytes even with 8-byte
+      alignment, since the new size will always be at least 8 bytes bigger than
+      the old size.}
+      if LInd <= High(CSmallBlockMoves) then
+        SmallBlockTypes[LNumaNode, LInd].UpsizeMoveProcedure := CSmallBlockMoves[LInd]
+      else
+    {$ifdef UseCustomVariableSizeMoveRoutines}
+        SmallBlockTypes[LNumaNode, LInd].UpsizeMoveProcedure := MoveX16LP;
+    {$else}
+        SmallBlockTypes[LNumaNode, LInd].UpsizeMoveProcedure := @System.Move;
+    {$endif}
   {$endif}
+  {$ifdef LogLockContention}
+      SmallBlockTypes[LNumaNode, LInd].BlockCollector.Initialize;
+  {$endif}
+      {Set the first "available pool" to the block type itself, so that the
+       allocation routines know that there are currently no pools with free
+       blocks of this size.}
+      SmallBlockTypes[LNumaNode, LInd].PreviousPartiallyFreePool := @SmallBlockTypes[LNumaNode, LInd];
+      SmallBlockTypes[LNumaNode, LInd].NextPartiallyFreePool := @SmallBlockTypes[LNumaNode, LInd];
+      {Set the block size to block type index translation table}
+      for LSizeInd := (LPreviousBlockSize div SmallBlockGranularity) to ((SmallBlockTypes[LNumaNode, LInd].BlockSize - 1) div SmallBlockGranularity) do
+        AllocSize2SmallBlockTypeIndX4[LSizeInd] := LInd * 4;
+      {Cannot sequential feed yet: Ensure that the next address is greater than
+       the maximum address}
+      SmallBlockTypes[LNumaNode, LInd].MaxSequentialFeedBlockAddress := Pointer(0);
+      SmallBlockTypes[LNumaNode, LInd].NextSequentialFeedBlockAddress := Pointer(1);
+      {Get the mask to use for finding a medium block suitable for a block pool}
+      LMinimumPoolSize :=
+        ((SmallBlockTypes[LNumaNode, LInd].BlockSize * MinimumSmallBlocksPerPool
+          + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
+        and -MediumBlockGranularity) + MediumBlockSizeOffset;
+      if LMinimumPoolSize < MinimumMediumBlockSize then
+        LMinimumPoolSize := MinimumMediumBlockSize;
+      {Get the closest group number for the minimum pool size}
+      LGroupNumber := (LMinimumPoolSize - MinimumMediumBlockSize + MediumBlockBinsPerGroup * MediumBlockGranularity div 2)
+        div (MediumBlockBinsPerGroup * MediumBlockGranularity);
+      {Too large?}
+      if LGroupNumber > 7 then
+        LGroupNumber := 7;
+      {Set the bitmap}
+      SmallBlockTypes[LNumaNode, LInd].AllowedGroupsForBlockPoolBitmap := Byte(-(1 shl LGroupNumber));
+      {Set the minimum pool size}
+      SmallBlockTypes[LNumaNode, LInd].MinimumBlockPoolSize := MinimumMediumBlockSize + LGroupNumber * (MediumBlockBinsPerGroup * MediumBlockGranularity);
+      {Get the optimal block pool size}
+      LOptimalPoolSize := ((SmallBlockTypes[LNumaNode, LInd].BlockSize * TargetSmallBlocksPerPool
+          + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset)
+        and -MediumBlockGranularity) + MediumBlockSizeOffset;
+      {Limit the optimal pool size to within range}
+      if LOptimalPoolSize < OptimalSmallBlockPoolSizeLowerLimit then
+        LOptimalPoolSize := OptimalSmallBlockPoolSizeLowerLimit;
+      if LOptimalPoolSize > OptimalSmallBlockPoolSizeUpperLimit then
+        LOptimalPoolSize := OptimalSmallBlockPoolSizeUpperLimit;
+      {How many blocks will fit in the adjusted optimal size?}
+      LBlocksPerPool := (LOptimalPoolSize - SmallBlockPoolHeaderSize) div SmallBlockTypes[LNumaNode, LInd].BlockSize;
+      {Recalculate the optimal pool size to minimize wastage due to a partial
+       last block.}
+      SmallBlockTypes[LNumaNode, LInd].OptimalBlockPoolSize :=
+        ((LBlocksPerPool * SmallBlockTypes[LNumaNode, LInd].BlockSize + SmallBlockPoolHeaderSize + MediumBlockGranularity - 1 - MediumBlockSizeOffset) and -MediumBlockGranularity) + MediumBlockSizeOffset;
+  {$ifdef UseReleaseStack}
+      for LSlot := 0 to NumStacksPerBlock - 1 do
+        SmallBlockTypes[LNumaNode, LInd].ReleaseStack[LSlot].Initialize(ReleaseStackSize, SizeOf(Pointer));
+  {$endif}
+  {$ifdef CheckHeapForCorruption}
+      {Debug checks}
+      if (SmallBlockTypes[LNumaNode, LInd].OptimalBlockPoolSize < MinimumMediumBlockSize)
+        or (SmallBlockTypes[LNumaNode, LInd].BlockSize div SmallBlockGranularity * SmallBlockGranularity <> SmallBlockTypes[LNumaNode, LInd].BlockSize) then
+      begin
+    {$ifdef BCB6OrDelphi7AndUp}
+        System.Error(reInvalidPtr);
+    {$else}
+        System.RunError(reInvalidPtr);
+    {$endif}
+      end;
+  {$endif}
+      {Set the previous small block size}
+      LPreviousBlockSize := SmallBlockTypes[LNumaNode, LInd].BlockSize;
     end;
-{$endif}
-    {Set the previous small block size}
-    LPreviousBlockSize := SmallBlockTypes[LInd].BlockSize;
   end;
   {-------------------Set up the medium blocks-------------------}
 {$ifdef CheckHeapForCorruption}
@@ -9895,15 +9719,19 @@ begin
   {$endif}
   end;
 {$endif}
-  {There are currently no medium block pools}
-  MediumBlockPoolsCircularList.PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
-  MediumBlockPoolsCircularList.NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
-  {All medium bins are empty}
-  for LInd := 0 to High(MediumBlockBins) do
+  {Step through all the NUMA nodes}
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
-    LPMediumFreeBlock := @MediumBlockBins[LInd];
-    LPMediumFreeBlock.PreviousFreeBlock := LPMediumFreeBlock;
-    LPMediumFreeBlock.NextFreeBlock := LPMediumFreeBlock;
+    {There are currently no medium block pools}
+    MediumBlockPoolsCircularList[LNumaNode].PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
+    MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
+    {All medium bins are empty}
+    for LInd := 0 to High(MediumBlockBins[LNumaNode]) do
+    begin
+      LPMediumFreeBlock := @MediumBlockBins[LNumaNode, LInd];
+      LPMediumFreeBlock.PreviousFreeBlock := LPMediumFreeBlock;
+      LPMediumFreeBlock.NextFreeBlock := LPMediumFreeBlock;
+    end;
   end;
   {------------------Set up the large blocks---------------------}
   LargeBlocksCircularList.PreviousLargeBlockHeader := @LargeBlocksCircularList;
@@ -10185,17 +10013,19 @@ procedure CleanupReleaseStacks;
 var
   LInd: Integer;
   LMemory: Pointer;
+  LNumaNode: Integer;
   LSlot: Integer;
 begin
-  for LInd := 0 to High(SmallBlockTypes) do begin
-    for LSlot := 0 to NumStacksPerBlock-1 do
-      while SmallBlockTypes[LInd].ReleaseStack[LSlot].Pop(LMemory) do
-        FastFreeMem(LMemory);
-    {Finalize all stacks only after all memory for this block has been freed.}
-    {Otherwise, FastFreeMem could try to access a stack that was already finalized.}
-    for LSlot := 0 to NumStacksPerBlock-1 do
-      SmallBlockTypes[LInd].ReleaseStack[LSlot].Finalize;
-  end;
+  for LNumaNode := 0 to CMaxNumaNodes - 1 do
+    for LInd := 0 to High(SmallBlockTypes) do begin
+      for LSlot := 0 to NumStacksPerBlock-1 do
+        while SmallBlockTypes[LNumaNode, LInd].ReleaseStack[LSlot].Pop(LMemory) do
+          FastFreeMem(LMemory);
+      {Finalize all stacks only after all memory for this block has been freed.}
+      {Otherwise, FastFreeMem could try to access a stack that was already finalized.}
+      for LSlot := 0 to NumStacksPerBlock-1 do
+        SmallBlockTypes[LNumaNode, LInd].ReleaseStack[LSlot].Finalize;
+    end;
   for LSlot := 0 to NumStacksPerBlock-1 do
   begin
     while MediumReleaseStack[LSlot].Pop(LMemory) do
@@ -10211,47 +10041,49 @@ begin
 end;
 
 function ReleaseStackCleanupThreadProc(const AParam: Pointer): Integer;
-var
-  LMemBlock: Pointer;
-  LSlot: Integer;
+//var
+//  LMemBlock: Pointer;
+//  LSlot: Integer;
 begin
   {Clean up 1 medium and 1 large block for every thread slot, every 100ms.}
-  while WaitForSingleObject(ReleaseStackCleanupThreadTerminate, 100) = WAIT_TIMEOUT do
-  begin
-    for LSlot := 0 to NumStacksPerBlock - 1 do
-    begin
-      if (not MediumReleaseStack[LSlot].IsEmpty)
-        and (LockCmpxchg(0, 1, @MediumBlocksLocked) = 0) then
-      begin
-        if MediumReleaseStack[LSlot].Pop(LMemBlock) then
-          FreeMediumBlock(LMemBlock, True)
-        else
-          MediumBlocksLocked := False;
-      end;
-      if (not LargeReleaseStack[LSlot].IsEmpty)
-        and (LockCmpxchg(0, 1, @LargeBlocksLocked) = 0) then
-      begin
-        if LargeReleaseStack[LSlot].Pop(LMemBlock) then
-          FreeLargeBlock(LMemBlock, True)
-        else
-          LargeBlocksLocked := False;
-      end;
-    end;
-  end;
+// TODO 1 -oPrimoz Gabrijelcic : *** NEEDS TO BE REIMPLEMENTED FOR NUMA ***
+//  while WaitForSingleObject(ReleaseStackCleanupThreadTerminate, 100) = WAIT_TIMEOUT do
+//  begin
+//    for LSlot := 0 to NumStacksPerBlock - 1 do
+//    begin
+//      if (not MediumReleaseStack[LSlot].IsEmpty)
+//        and (LockCmpxchg(0, 1, @MediumBlocksLocked) = 0) then
+//      begin
+//        if MediumReleaseStack[LSlot].Pop(LMemBlock) then
+//          FreeMediumBlock(LMemBlock, True)
+//        else
+//          MediumBlocksLocked := False;
+//      end;
+//      if (not LargeReleaseStack[LSlot].IsEmpty)
+//        and (LockCmpxchg(0, 1, @LargeBlocksLocked) = 0) then
+//      begin
+//        if LargeReleaseStack[LSlot].Pop(LMemBlock) then
+//          FreeLargeBlock(LMemBlock, True)
+//        else
+//          LargeBlocksLocked := False;
+//      end;
+//    end;
+//  end;
   Result := 0;
 end;
 
 procedure CreateCleanupThread;
-var
-  LThreadID: DWORD;
+//var
+//  LThreadID: DWORD;
 begin
-  ReleaseStackCleanupThreadTerminate := CreateEvent(nil, False, False, nil);
-  if ReleaseStackCleanupThreadTerminate = 0 then
-    {$ifdef BCB6OrDelphi7AndUp}System.Error(reInvalidPtr);{$else}System.RunError(reInvalidPtr);{$endif}
-  ReleaseStackCleanupThread := BeginThread(nil, 0, @ReleaseStackCleanupThreadProc, nil, 0, LThreadID);
-  if ReleaseStackCleanupThread = 0 then
-    {$ifdef BCB6OrDelphi7AndUp}System.Error(reInvalidPtr);{$else}System.RunError(reInvalidPtr);{$endif}
-  SetThreadPriority(ReleaseStackCleanupThread, THREAD_PRIORITY_LOWEST);
+// TODO 1 -oPrimoz Gabrijelcic : *** NEEDS TO BE REIMPLEMENTED FOR NUMA ***
+//  ReleaseStackCleanupThreadTerminate := CreateEvent(nil, False, False, nil);
+//  if ReleaseStackCleanupThreadTerminate = 0 then
+//    {$ifdef BCB6OrDelphi7AndUp}System.Error(reInvalidPtr);{$else}System.RunError(reInvalidPtr);{$endif}
+//  ReleaseStackCleanupThread := BeginThread(nil, 0, @ReleaseStackCleanupThreadProc, nil, 0, LThreadID);
+//  if ReleaseStackCleanupThread = 0 then
+//    {$ifdef BCB6OrDelphi7AndUp}System.Error(reInvalidPtr);{$else}System.RunError(reInvalidPtr);{$endif}
+//  SetThreadPriority(ReleaseStackCleanupThread, THREAD_PRIORITY_LOWEST);
 end;
 
 procedure DestroyCleanupThread;
