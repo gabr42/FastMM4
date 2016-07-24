@@ -4098,11 +4098,10 @@ end;
  allow for alignment etc.). ASize must be the actual user requested size. This
  procedure will pad it to the appropriate page boundary and also add the space
  required by the header.}
-function AllocateLargeBlock(ASize: NativeUInt {$ifdef LogLockContention}; var ADidSleep: Boolean{$endif}): Pointer;
+function AllocateLargeBlock(ANumaNode: integer; ASize: NativeUInt {$ifdef LogLockContention}; var ADidSleep: Boolean{$endif}): Pointer;
 var
   LLargeUsedBlockSize: NativeUInt;
   LOldFirstLargeBlock: PLargeBlockHeader;
-  LNumaNode: Integer;
 begin
   {Pad the block size to include the header and granularity. We also add a
    SizeOf(Pointer) overhead so a huge block size is a multiple of 16 bytes less
@@ -4112,9 +4111,8 @@ begin
     and -LargeBlockGranularity;
   {Get the Large block}
   // ***TEMPORARY***
-  LNumaNode := GetThreadNUMANode;
   Result := VirtualAllocExNuma($FFFFFFFF {GetCurrentProcess}, nil, LLargeUsedBlockSize,
-    MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE, LNumaNode);
+    MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE, ANumaNode);
 //  Result := VirtualAlloc(nil, LLargeUsedBlockSize, MEM_RESERVE or MEM_COMMIT or MEM_TOP_DOWN,
 //    PAGE_READWRITE);
   {Set the Large block fields}
@@ -4130,7 +4128,7 @@ begin
     LargeBlocksCircularList.NextLargeBlockHeader := Result;
     PLargeBlockHeader(Result).NextLargeBlockHeader := LOldFirstLargeBlock;
     LOldFirstLargeBlock.PreviousLargeBlockHeader := Result;
-    PLargeBlockHeader(Result).NumaNode := LNumaNode;
+    PLargeBlockHeader(Result).NumaNode := ANumaNode;
     LargeBlocksLocked := False;
     {Add the size of the header}
     Inc(PByte(Result), LargeBlockHeaderSize);
@@ -4420,7 +4418,6 @@ var
 {$endif}
   LNumaNode: integer;
 begin
-OutputDebugStringA('Get');
 {$ifdef LogLockContention}
   ACollector := nil;
 {$endif}
@@ -4837,7 +4834,7 @@ OutputDebugStringA('Get');
       {Allocate a Large block}
       if ASize > 0 then
       begin
-        Result := AllocateLargeBlock(ASize {$ifdef LogLockContention}, LDidSleep{$endif});
+        Result := AllocateLargeBlock(LNumaNode, ASize {$ifdef LogLockContention}, LDidSleep{$endif});
 {$ifdef LogLockContention}
         if LDidSleep then
           ACollector := @LargeBlockCollector;
@@ -4885,6 +4882,10 @@ begin
   LBlockSize := LBlockHeader and DropMediumAndLargeFlagsMask;
   {When running a cleanup operation, medium blocks are already locked.}
   LNumaNode := PBlockHeader(PByte(APointer) - BlockHeaderSize)^.NumaNode;
+
+// TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
+Assert(LNumaNode in [0,1]);
+
 {$ifdef UseReleaseStack}
   if not ACleanupOperation then
   begin
@@ -5101,7 +5102,6 @@ var
   LPReleaseStack: ^TLFStack;
 {$endif}
 begin
-OutputDebugStringA('Free');
   {$ifdef fpc}
   if APointer = nil then
   begin
@@ -5390,13 +5390,17 @@ begin
     Exit;
   end;
 {$endif}
-  LNumaNode := GetThreadNUMANode;
 {$ifdef LogLockContention}
   LCollector := nil;
   try
 {$endif}
   {Get the block header: Is it actually a small block?}
-  LBlockHeader := PNativeUInt(PByte(APointer) - BlockHeaderSize)^;
+  with PBlockHeader(PByte(APointer) - BlockHeaderSize)^ do begin
+    LBlockHeader := FlagsAndSize;
+    LNumaNode := NumaNode;
+  end;
+// TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
+Assert(LNumaNode in [0,1]);
   {Is it a small block that is in use?}
   if LBlockHeader and (IsFreeBlockFlag or IsMediumBlockFlag or IsLargeBlockFlag) = 0 then
   begin

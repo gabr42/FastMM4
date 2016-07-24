@@ -83,7 +83,7 @@ Set the default options for FastMM here.
 
 {Set this option to use the Windows API OutputDebugString procedure to output
  debug strings on startup/shutdown and when errors occur.}
-{$define UseOutputDebugString}
+{.$define UseOutputDebugString}
 
 {Set this option to use the assembly language version which is faster than the
  pascal version. Disable only for debugging purposes. Setting the
