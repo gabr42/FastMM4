@@ -2211,6 +2211,9 @@ var
   pn: TProcessorNumber;
   nn: word;
 begin
+  // TODO 1 -oPrimoz Gabrijelcic : *** TESTING, NUMANODE := 1 ***
+  Exit(1);
+
   // Automatically atomic on Intel
   if CurrentThreadGACount < ThreadGACount then begin
     CurrentThreadGACount := ThreadGACount;
@@ -3832,9 +3835,9 @@ begin
 end;
 
 {Locks the medium blocks.}
-procedure LockMediumBlocks(numaNode: integer;
-  {$ifdef LogLockContention}var ADidSleep: Boolean{$ifdef UseReleaseStack};{$endif}{$endif}
-  {$ifdef UseReleaseStack}APointer: Pointer = nil; APDelayRelease: PBoolean = nil{$endif});
+procedure LockMediumBlocks(numaNode: integer
+  {$ifdef LogLockContention}; var ADidSleep: Boolean{$endif}
+  {$ifdef UseReleaseStack}; APointer: Pointer = nil; APDelayRelease: PBoolean = nil{$endif});
 {$ifdef UseReleaseStack}
 var
   LPReleaseStack: ^TLFStack;
@@ -4891,9 +4894,9 @@ Assert(LNumaNode in [0,1]);
   begin
 {$endif}
     {Lock the medium blocks}
-    LockMediumBlocks(LNumaNode,
-      {$ifdef LogLockContention}LDidSleep{$ifdef UseReleaseStack},{$endif}{$endif}
-      {$ifdef UseReleaseStack}APointer, @LDelayRelease{$endif});
+    LockMediumBlocks(LNumaNode
+      {$ifdef LogLockContention}, LDidSleep{$endif}
+      {$ifdef UseReleaseStack}, APointer, @LDelayRelease{$endif});
 {$ifdef UseReleaseStack}
     if LDelayRelease then
     begin
@@ -5014,7 +5017,7 @@ Assert(LNumaNode in [0,1]);
 {$endif}
 {$ifndef UseReleaseStack}
       {Unlock medium blocks}
-      MediumBlocksLocked := False;
+      MediumBlocksLocked[LNumaNode] := False;
 {$endif}
       {All OK}
       Result := 0;
@@ -5399,6 +5402,7 @@ begin
     LBlockHeader := FlagsAndSize;
     LNumaNode := NumaNode;
   end;
+//ScanMemoryPoolForCorruptions;
 // TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
 Assert(LNumaNode in [0,1]);
   {Is it a small block that is in use?}
@@ -7158,54 +7162,57 @@ var
   LPMediumBlock: Pointer;
   LPMediumBlockPoolHeader: PMediumBlockPoolHeader;
   LMediumBlockHeader: NativeUInt;
+  LNumaNode: integer;
 begin
   {Block all the memory manager routines while performing the scan. No memory
    block may be allocated or freed, and no FullDebugMode block header or
    footer may be modified, while the scan is in progress.}
   BlockFullDebugModeMMRoutines;
   try
-    {Step through all the medium block pools}
-    LPMediumBlockPoolHeader := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
-    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
-    begin
-      LPMediumBlock := GetFirstMediumBlockInPool(LPMediumBlockPoolHeader);
-      while LPMediumBlock <> nil do
+    for LNumaNode := 0 to CMaxNumaNodes - 1 do begin
+      {Step through all the medium block pools}
+      LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
+      while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList[LNumaNode] do
       begin
-        LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
-        {Is the block in use?}
-        if LMediumBlockHeader and IsFreeBlockFlag = 0 then
+        LPMediumBlock := GetFirstMediumBlockInPool(LNumaNode, LPMediumBlockPoolHeader);
+        while LPMediumBlock <> nil do
         begin
-          {Block is in use: Is it a medium block or small block pool?}
-          if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
+          LMediumBlockHeader := PNativeUInt(PByte(LPMediumBlock) - BlockHeaderSize)^;
+          {Is the block in use?}
+          if LMediumBlockHeader and IsFreeBlockFlag = 0 then
           begin
-            {Get all the leaks for the small block pool}
-            InternalScanSmallBlockPool(LPMediumBlock, AFirstAllocationGroupToLog, ALastAllocationGroupToLog);
+            {Block is in use: Is it a medium block or small block pool?}
+            if (LMediumBlockHeader and IsSmallBlockPoolInUseFlag) <> 0 then
+            begin
+              {Get all the leaks for the small block pool}
+              InternalScanSmallBlockPool(LPMediumBlock, AFirstAllocationGroupToLog, ALastAllocationGroupToLog);
+            end
+            else
+            begin
+              if CheckBlockBeforeFreeOrRealloc(LPMediumBlock, boBlockCheck) then
+              begin
+                if (PFullDebugBlockHeader(LPMediumBlock).AllocationGroup >= AFirstAllocationGroupToLog)
+                  and (PFullDebugBlockHeader(LPMediumBlock).AllocationGroup <= ALastAllocationGroupToLog) then
+                begin
+                  LogMemoryLeakOrAllocatedBlock(LPMediumBlock, False);
+                end;
+              end
+              else
+                RaiseMemoryCorruptionError;
+            end;
           end
           else
           begin
-            if CheckBlockBeforeFreeOrRealloc(LPMediumBlock, boBlockCheck) then
-            begin
-              if (PFullDebugBlockHeader(LPMediumBlock).AllocationGroup >= AFirstAllocationGroupToLog)
-                and (PFullDebugBlockHeader(LPMediumBlock).AllocationGroup <= ALastAllocationGroupToLog) then
-              begin
-                LogMemoryLeakOrAllocatedBlock(LPMediumBlock, False);
-              end;
-            end
-            else
+            {Check that the block has not been modified since being freed}
+            if not CheckFreeBlockUnmodified(LPMediumBlock, LMediumBlockHeader and DropMediumAndLargeFlagsMask, boBlockCheck) then
               RaiseMemoryCorruptionError;
           end;
-        end
-        else
-        begin
-          {Check that the block has not been modified since being freed}
-          if not CheckFreeBlockUnmodified(LPMediumBlock, LMediumBlockHeader and DropMediumAndLargeFlagsMask, boBlockCheck) then
-            RaiseMemoryCorruptionError;
+          {Next medium block}
+          LPMediumBlock := NextMediumBlock(LPMediumBlock);
         end;
-        {Next medium block}
-        LPMediumBlock := NextMediumBlock(LPMediumBlock);
+        {Get the next medium block pool}
+        LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
       end;
-      {Get the next medium block pool}
-      LPMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
     end;
     {Scan large blocks}
     LPLargeBlock := LargeBlocksCircularList.NextLargeBlockHeader;
@@ -9655,7 +9662,7 @@ begin
       {The upsize move procedure may move chunks in 16 bytes even with 8-byte
       alignment, since the new size will always be at least 8 bytes bigger than
       the old size.}
-      if LInd <= High(CSmallBlockMoves) then
+      if (LInd <= High(CSmallBlockMoves)) and assigned(CSmallBlockMoves[LInd]) then
         SmallBlockTypes[LNumaNode, LInd].UpsizeMoveProcedure := CSmallBlockMoves[LInd]
       else
     {$ifdef UseCustomVariableSizeMoveRoutines}
