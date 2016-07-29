@@ -1882,7 +1882,7 @@ type
     {The pool pointer and flags of the first block}
     FirstBlockPoolPointerAndFlags: NativeUInt;
     {NUMA node}
-    NumaNode: Integer;
+    NumaNode: Integer; // TODO 1 -oPrimoz Gabrijelcic : *** Do we need this? Or can we use PBlockHeader(@ - BlockHeaderSize)^.NumaNode?
 {$ifndef 32Bit}
     Padding: Integer;
 {$endif}
@@ -2212,7 +2212,7 @@ var
   nn: word;
 begin
   // TODO 1 -oPrimoz Gabrijelcic : *** TESTING, NUMANODE := 1 ***
-  Exit(1);
+//  Exit(1);
 
   // Automatically atomic on Intel
   if CurrentThreadGACount < ThreadGACount then begin
@@ -3900,7 +3900,7 @@ begin
   if LPreviousFreeBlock = LNextFreeBlock then
   begin
     {Get the bin number for this block size}
-    LBinNumber := (UIntPtr(LNextFreeBlock) - UIntPtr(@MediumBlockBins[numaNode])) div SizeOf(TMediumFreeBlock);
+    LBinNumber := (UIntPtr(LNextFreeBlock) - UIntPtr(@MediumBlockBins[numaNode,0])) div SizeOf(TMediumFreeBlock);
     LBinGroupNumber := LBinNumber div 32;
     {Flag this bin as empty}
     MediumBlockBinBitmaps[numaNode, LBinGroupNumber] := MediumBlockBinBitmaps[numaNode, LBinGroupNumber]
@@ -4023,7 +4023,7 @@ begin
   begin
     {Insert this block pool into the list of block pools}
     LOldFirstMediumBlockPool := MediumBlockPoolsCircularList[ANumaNode].NextMediumBlockPoolHeader;
-    PMediumBlockPoolHeader(LNewPool).PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
+    PMediumBlockPoolHeader(LNewPool).PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList[ANumaNode];
     MediumBlockPoolsCircularList[ANumaNode].NextMediumBlockPoolHeader := LNewPool;
     PMediumBlockPoolHeader(LNewPool).NextMediumBlockPoolHeader := LOldFirstMediumBlockPool;
     LOldFirstMediumBlockPool.PreviousMediumBlockPoolHeader := LNewPool;
@@ -4034,6 +4034,7 @@ begin
     MediumSequentialFeedBytesLeft[ANumaNode] := (MediumBlockPoolSize - MediumBlockPoolHeaderSize) - AFirstBlockSize;
     {Get the result}
     Result := Pointer(PByte(LNewPool) + MediumBlockPoolSize - AFirstBlockSize);
+    PBlockHeader(PByte(Result) - BlockHeaderSize)^.NumaNode := ANumaNode;
     LastSequentiallyFedMediumBlock[ANumaNode] := Result;
     {Store the block header and NUMA node}
     with PBlockHeader(PByte(Result) - BlockHeaderSize)^  do begin
@@ -4612,6 +4613,7 @@ begin
               LBlockSize := LSequentialFeedFreeSize;
             {Get the block}
             LMediumBlock := Pointer(PByte(LastSequentiallyFedMediumBlock[LNumaNode]) - LBlockSize);
+            PBlockHeader(PByte(LMediumBlock) - BlockHeaderSize)^.NumaNode := LNumaNode;
             {Update the sequential feed parameters}
             LastSequentiallyFedMediumBlock[LNumaNode] := LMediumBlock;
             MediumSequentialFeedBytesLeft[LNumaNode] := LSequentialFeedFreeSize - LBlockSize;
@@ -7908,7 +7910,7 @@ begin
       try
         {Step through all the medium block pools}
         LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
-        while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+        while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList[LNumaNode] do
         begin
           LPMediumBlock := GetFirstMediumBlockInPool(LNumaNode, LPMediumBlockPoolHeader);
           while LPMediumBlock <> nil do
@@ -8584,7 +8586,7 @@ begin
   begin
     {Step through all the medium block pools}
     LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
-    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList[LNumaNode] do
     begin
       LPMediumBlock := GetFirstMediumBlockInPool(LNumaNode, LPMediumBlockPoolHeader);
       while LPMediumBlock <> nil do
@@ -8905,7 +8907,7 @@ begin
     LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
     {Step through all the medium block pools}
     LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
-    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList[LNumaNode] do
     begin
       {Add to the medium block used space}
       Inc(AMemoryManagerState.ReservedMediumBlockAddressSpace, MediumBlockPoolSize);
@@ -9020,7 +9022,7 @@ begin
     {Step through all the medium block pools}
     LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
     LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
-    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList[LNumaNode] do
     begin
       {Add to the medium block used space}
       LChunkIndex := NativeUInt(LPMediumBlockPoolHeader) shr 16;
@@ -9119,7 +9121,7 @@ begin
     LockMediumBlocks(LNumaNode{$ifdef LogLockContention}, LDidSleep{$endif});
     {Step through all the medium block pools}
     LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
-    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList[LNumaNode] do
     begin
       {Add to the total and committed address space}
       Inc(Result.TotalAddrSpace, ((MediumBlockPoolSize + $ffff) and $ffff0000));
@@ -9216,7 +9218,7 @@ begin
   begin
     {Free all block pools}
     LPMediumBlockPoolHeader := MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader;
-    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList do
+    while LPMediumBlockPoolHeader <> @MediumBlockPoolsCircularList[LNumaNode] do
     begin
       {Get the next medium block pool so long}
       LPNextMediumBlockPoolHeader := LPMediumBlockPoolHeader.NextMediumBlockPoolHeader;
@@ -9241,8 +9243,8 @@ begin
       SmallBlockTypes[LNumaNode, Lind].MaxSequentialFeedBlockAddress := nil;
     end;
     {Clear all medium block pools}
-    MediumBlockPoolsCircularList[LNumaNode].PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
-    MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
+    MediumBlockPoolsCircularList[LNumaNode].PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList[LNumaNode];
+    MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList[LNumaNode];
     {All medium bins are empty}
     for LInd := 0 to High(MediumBlockBins[LNumaNode]) do
     begin
@@ -9756,8 +9758,8 @@ begin
   for LNumaNode := 0 to CMaxNumaNodes - 1 do
   begin
     {There are currently no medium block pools}
-    MediumBlockPoolsCircularList[LNumaNode].PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
-    MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList;
+    MediumBlockPoolsCircularList[LNumaNode].PreviousMediumBlockPoolHeader := @MediumBlockPoolsCircularList[LNumaNode];
+    MediumBlockPoolsCircularList[LNumaNode].NextMediumBlockPoolHeader := @MediumBlockPoolsCircularList[LNumaNode];
     {All medium bins are empty}
     for LInd := 0 to High(MediumBlockBins[LNumaNode]) do
     begin
