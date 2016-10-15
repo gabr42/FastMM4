@@ -5,7 +5,7 @@ program SimpleNUMATest;
 {$R *.res}
 
 uses
-  FastMM4 in 'FastMM4-MP\FastMM4.pas',
+  FastMM4 in '..\FastMM4.pas',
   System.SysUtils,
   SimpleNUMATest1 in 'SimpleNUMATest1.pas';
 

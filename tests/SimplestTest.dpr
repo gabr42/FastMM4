@@ -5,7 +5,7 @@ program SimplestTest;
 {$R *.res}
 
 uses
-  FastMM4 in 'FastMM4-MP\FastMM4.pas';
+  FastMM4 in '..\FastMM4.pas';
 
 var
 //  p: array [1..10] of pointer;
