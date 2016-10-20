@@ -1862,8 +1862,7 @@ type
 {$endif}
   end;
 
-  // TODO 1 -oPrimoz Gabrijelcic : *** size info is incorrect
-  {Small block pool (Size = 32 bytes for 32-bit, 48 bytes for 64-bit).}
+  {Small block pool (Size = 32 bytes for 32-bit, 64 bytes for 64-bit).}
   TSmallBlockPoolHeader = record
     {BlockType}
     BlockType: PSmallBlockType;
@@ -1882,21 +1881,21 @@ type
     FirstFreeBlock: Pointer;
     {The number of blocks allocated in this pool.}
     BlocksInUse: Cardinal;
-    {The pool pointer and flags of the first block}
-    FirstBlockPoolPointerAndFlags: NativeUInt;
     {NUMA node}
     NumaNode: Integer; // TODO 1 -oPrimoz Gabrijelcic : *** Do we need this? Or can we use PBlockHeader(@ - BlockHeaderSize)^.NumaNode?
 {$ifndef 32Bit}
-    Padding: Integer;
+    Padding: array [1..3] of Integer;
 {$endif}
+    {The pool pointer and flags of the first block}
+    FirstBlockPoolPointerAndFlags: NativeUInt;
   end;
 
   TBlockHeader = packed record
-    FlagsAndSize: NativeUInt;
     NumaNode: Integer;
 {$ifndef 32Bit}
     Padding: Integer;
 {$endif}
+    FlagsAndSize: NativeUInt;
   end;
   PBlockHeader = ^TBlockHeader;
 
@@ -1908,7 +1907,6 @@ type
 
   {------------------------Medium block structures------------------------}
 
-  // TODO 1 -oPrimoz Gabrijelcic : *** size info is incorrect
   {The medium block pool from which medium blocks are drawn. Size = 16 bytes
    for 32-bit and 32 bytes for 64-bit.}
   PMediumBlockPoolHeader = ^TMediumBlockPoolHeader;
@@ -1917,14 +1915,9 @@ type
      list is used to track memory leaks on program shutdown.}
     PreviousMediumBlockPoolHeader: PMediumBlockPoolHeader;
     NextMediumBlockPoolHeader: PMediumBlockPoolHeader;
-    {Padding}
-    Reserved1: NativeUInt;
+    NumaNode: Integer;
     {The block size and flags of the first medium block in the block pool}
     FirstMediumBlockSizeAndFlags: NativeUInt;
-    NumaNode: Integer;
-{$ifndef 32Bit}
-    Padding: Integer;
-{$endif}
   end;
 
   {Medium block layout:
@@ -1944,22 +1937,19 @@ type
 
   {-------------------------Large block structures------------------------}
 
-  // TODO 1 -oPrimoz Gabrijelcic : *** size info is incorrect
-  {Large block header record (Size = 16 for 32-bit, 32 for 64-bit)}
+  {Large block header record (Size = 32 for 32-bit, 48 for 64-bit)}
   PLargeBlockHeader = ^TLargeBlockHeader;
   TLargeBlockHeader = record
     {Points to the previous and next large blocks. This circular linked
      list is used to track memory leaks on program shutdown.}
     PreviousLargeBlockHeader: PLargeBlockHeader;
     NextLargeBlockHeader: PLargeBlockHeader;
+    NumaNode: Integer;
+    Padding: array [1..3] of Integer;
     {The user allocated size of the Large block}
     UserAllocatedSize: NativeUInt;
     {The size of this block plus the flags}
     BlockSizeAndFlags: NativeUInt;
-    NumaNode: Integer;
-{$ifndef 32Bit}
-    Padding: Integer;
-{$endif}
   end;
 
   {-------------------------Expected Memory Leak Structures--------------------}
@@ -2025,11 +2015,16 @@ const
 {Small block initialization block.}
 const
   CSmallBlockSizes: array [0..NumSmallBlockTypes - 1] of integer = (
-    {$ifndef Align16Bytes}8,{$endif} 16, {$ifndef Align16Bytes}24,{$endif} 32,
-    {$ifndef Align16Bytes}40,{$endif} 48, {$ifndef Align16Bytes}56,{$endif} 64,
-    {$ifndef Align16Bytes}72,{$endif} 80, {$ifndef Align16Bytes}88,{$endif} 96,
-    {$ifndef Align16Bytes}104,{$endif} 112, {$ifndef Align16Bytes}120,{$endif} 128,
-    {$ifndef Align16Bytes}136,{$endif} 144, {$ifndef Align16Bytes}152,{$endif} 160,
+    {$ifndef Align16Bytes}8,{$endif}       16,
+    {$ifndef Align16Bytes}24,{$endif}      32,
+    {$ifndef Align16Bytes}40,{$endif}      48,
+    {$ifndef Align16Bytes}56,{$endif}      64,
+    {$ifndef Align16Bytes}72,{$endif}      80,
+    {$ifndef Align16Bytes}88,{$endif}      96,
+    {$ifndef Align16Bytes}104,{$endif}    112,
+    {$ifndef Align16Bytes}120,{$endif}    128,
+    {$ifndef Align16Bytes}136,{$endif}    144,
+    {$ifndef Align16Bytes}152,{$endif}    160,
     176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 352, 384, 416, 448, 480, 528,
     576, 624, 672, 736, 800, 880, 960, 1056, 1152, 1264, 1376, 1504, 1648, 1808,
     1984, 2176, 2384, MaximumSmallBlockSize,
@@ -2041,14 +2036,19 @@ const
     MaximumSmallBlockSize);
 
   CSmallBlockMoves: array [0..NumSmallBlockTypes - 1] of TMoveProc = (
-    {$ifndef Align16Bytes}Move4,{$endif} {$ifdef 32Bit}Move12{$else}Move8{$endif},
+    {$ifndef Align16Bytes}Move4,{$endif}  {$ifdef 32Bit}Move12{$else}Move8{$endif},
     {$ifndef Align16Bytes}Move20,{$endif} {$ifdef 32Bit}Move28{$else}Move24{$endif},
     {$ifndef Align16Bytes}Move36,{$endif} {$ifdef 32Bit}Move44{$else}Move40{$endif},
     {$ifndef Align16Bytes}Move52,{$endif} {$ifdef 32Bit}Move60{$else}Move56{$endif},
-    {$ifndef Align16Bytes}Move68,{$endif}
-    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
-    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
-    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil);
+    {$ifndef Align16Bytes}Move68,{$endif} nil,
+    {$ifndef Align16Bytes}nil,{$endif}    nil,
+    {$ifndef Align16Bytes}nil,{$endif}    nil,
+    {$ifndef Align16Bytes}nil,{$endif}    nil,
+    {$ifndef Align16Bytes}nil,{$endif}    nil,
+    {$ifndef Align16Bytes}nil,{$endif}    nil,
+    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+    nil, nil);
 
 var
   {-----------------Small block management------------------}
@@ -6829,7 +6829,7 @@ begin
         {Set the user size for the block}
         PFullDebugBlockHeader(Result).UserSize := ASize;
         {Set the checksums}
-        UpdateHeaderAndFooterCheckSums(Result);
+        UpdateHeaderAndFooterCheckSums(Result); //$7FE667D0
         {$ifdef FullDebugModeCallBacks}
         if Assigned(OnDebugGetMemFinish) then
           OnDebugGetMemFinish(PFullDebugBlockHeader(Result), ASize);
@@ -6858,6 +6858,7 @@ begin
     {Leaving the memory manager routine: Block scans may be performed again.}
     DoneChangingFullDebugModeBlock;
   end;
+  ScanMemoryPoolForCorruptions;
 end;
 
 function CheckBlockBeforeFreeOrRealloc(APBlock: PFullDebugBlockHeader;
@@ -10248,7 +10249,12 @@ begin
 end;
 
 initialization
+  Assert(SizeOf(TSmallBlockPoolHeader) = {$IFDEF 64Bit}64{$ELSE}32{$ENDIF}, 'Incorrect SizeOf(TSmallBlockPoolHeader)');
+  Assert(SizeOf(TMediumBlockPoolHeader) = {$IFDEF 64Bit}32{$ELSE}16{$ENDIF}, 'Incorrect SizeOf(TMediumBlockPoolHeader)');
+  Assert(SizeOf(TLargeBlockHeader) = {$IFDEF 64Bit}48{$ELSE}32{$ENDIF}, 'Incorrect SizeOf(TLargeBlockHeader)');
+
   RunInitializationCode;
+  FullDebugModeScanMemoryPoolBeforeEveryOperation := true;
 
 finalization
 {$ifndef PatchBCBTerminate}
