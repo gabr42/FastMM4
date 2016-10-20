@@ -10249,9 +10249,15 @@ begin
 end;
 
 initialization
-  Assert(SizeOf(TSmallBlockPoolHeader) = {$IFDEF 64Bit}64{$ELSE}32{$ENDIF}, 'Incorrect SizeOf(TSmallBlockPoolHeader)');
-  Assert(SizeOf(TMediumBlockPoolHeader) = {$IFDEF 64Bit}32{$ELSE}16{$ENDIF}, 'Incorrect SizeOf(TMediumBlockPoolHeader)');
-  Assert(SizeOf(TLargeBlockHeader) = {$IFDEF 64Bit}48{$ELSE}32{$ENDIF}, 'Incorrect SizeOf(TLargeBlockHeader)');
+  if (SizeOf(TSmallBlockPoolHeader) <> {$IFDEF 64Bit}64{$ELSE}32{$ENDIF})
+  or (SizeOf(TMediumBlockPoolHeader) <> {$IFDEF 64Bit}32{$ELSE}16{$ENDIF})
+  or (SizeOf(TLargeBlockHeader) <> {$IFDEF 64Bit}48{$ELSE}32{$ENDIF})
+  then
+  {$ifdef BCB6OrDelphi7AndUp}
+    System.Error(reInvalidPtr);
+  {$else}
+    System.RunError(reInvalidPtr);
+  {$endif}
 
   RunInitializationCode;
   FullDebugModeScanMemoryPoolBeforeEveryOperation := true;
