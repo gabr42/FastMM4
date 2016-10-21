@@ -1945,10 +1945,11 @@ type
      list is used to track memory leaks on program shutdown.}
     PreviousLargeBlockHeader: PLargeBlockHeader;
     NextLargeBlockHeader: PLargeBlockHeader;
-    NumaNode: Integer;
-    Padding: array [1..3] of Integer;
     {The user allocated size of the Large block}
     UserAllocatedSize: NativeUInt;
+    Padding1: array [1..2] of Integer;
+    NumaNode: Integer;
+    Padding2: Integer;
     {The size of this block plus the flags}
     BlockSizeAndFlags: NativeUInt;
   end;
@@ -6855,7 +6856,7 @@ begin
       else
       begin
 {$ifdef LogLockContention}
-        if assigned(LCollector) then 
+        if assigned(LCollector) then
         begin
           GetStackTrace(@LStackTrace, StackTraceDepth, 1);
           LCollector.Add(@LStackTrace[0], StackTraceDepth);
@@ -9352,13 +9353,13 @@ begin
   LargeBlockCollector.GetData(mergedData, mergedCount);
   MediumBlockCollector.GetData(data, count);
   LargeBlockCollector.Merge(mergedData, mergedCount, data, count);
-  for i := 0 to High(SmallBlockTypes) do 
+  for i := 0 to High(SmallBlockTypes) do
   begin
     SmallBlockTypes[i].BlockCollector.GetData(data, count);
     LargeBlockCollector.Merge(mergedData, mergedCount, data, count);
   end;
 
-  if mergedCount > 0 then 
+  if mergedCount > 0 then
   begin
     FillChar(LErrorMessage, SizeOf(LErrorMessage), 0);
     FillChar(LMessageTitleBuffer, SizeOf(LMessageTitleBuffer), 0);
@@ -9383,7 +9384,7 @@ begin
     end;
     AppendStringToModuleName(LockingReportTitle, LMessageTitleBuffer);
     ShowMessageBox(LErrorMessage, LMessageTitleBuffer);
-    for i := 4 to 10 do 
+    for i := 4 to 10 do
     begin
       if i > mergedCount then
         break; //for i
@@ -10325,3 +10326,4 @@ finalization
 {$endif}
 
 end.
+
