@@ -1882,15 +1882,19 @@ type
     FirstFreeBlock: Pointer;
     {The number of blocks allocated in this pool.}
     BlocksInUse: Cardinal;
+{$ifndef 32Bit}
+    Padding1: array [1..2] of Integer;
+{$endif}
     {NUMA node}
     NumaNode: Integer; // TODO 1 -oPrimoz Gabrijelcic : *** Do we need this? Or can we use PBlockHeader(@ - BlockHeaderSize)^.NumaNode?
 {$ifndef 32Bit}
-    Padding: array [1..3] of Integer;
+    Padding2: Integer;
 {$endif}
     {The pool pointer and flags of the first block}
     FirstBlockPoolPointerAndFlags: NativeUInt;
   end;
 
+  // Must overlap exactly with the end of TSmallBlockPoolHeader, TMediumBlockPoolHeader, and TLargeBlockHeader
   TBlockHeader = packed record
     NumaNode: Integer;
 {$ifndef 32Bit}
@@ -1908,7 +1912,7 @@ type
 
   {------------------------Medium block structures------------------------}
 
-  {The medium block pool from which medium blocks are drawn. Size = 16 bytes
+  {The medium block pool from which medium blocks are drawn. Size = 32 bytes
    for 32-bit and 32 bytes for 64-bit.}
   PMediumBlockPoolHeader = ^TMediumBlockPoolHeader;
   TMediumBlockPoolHeader = record
@@ -1916,7 +1920,12 @@ type
      list is used to track memory leaks on program shutdown.}
     PreviousMediumBlockPoolHeader: PMediumBlockPoolHeader;
     NextMediumBlockPoolHeader: PMediumBlockPoolHeader;
+    {$ifndef 64Bit}
+    Padding1: array [1..3] of Integer;
+    {$endif}
     NumaNode: Integer;
+    Padding2: Integer;
+
     {The block size and flags of the first medium block in the block pool}
     FirstMediumBlockSizeAndFlags: NativeUInt;
   end;
@@ -10308,7 +10317,7 @@ end;
 
 initialization
   if (SizeOf(TSmallBlockPoolHeader) <> {$IFDEF 64Bit}64{$ELSE}32{$ENDIF})
-  or (SizeOf(TMediumBlockPoolHeader) <> {$IFDEF 64Bit}32{$ELSE}16{$ENDIF})
+  or (SizeOf(TMediumBlockPoolHeader) <> {$IFDEF 64Bit}32{$ELSE}32{$ENDIF})
   or (SizeOf(TLargeBlockHeader) <> {$IFDEF 64Bit}48{$ELSE}32{$ENDIF})
   then
   {$ifdef BCB6OrDelphi7AndUp}
