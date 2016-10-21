@@ -1345,8 +1345,9 @@ function DebugFreeMem(APointer: Pointer): Integer;
 function DebugReallocMem(APointer: Pointer; ANewSize: {$ifdef XE2AndUp}NativeInt{$else}Integer{$endif}): Pointer;
 function DebugAllocMem(ASize: {$ifdef XE2AndUp}NativeInt{$else}Cardinal{$endif}): Pointer;
 {Scans the memory pool for any corruptions. If a corruption is encountered an "Out of Memory" exception is
- raised.}
-procedure ScanMemoryPoolForCorruptions;
+ raised.
+ ScanMPLogging is used for debugging the memory manager.}
+procedure ScanMemoryPoolForCorruptions{$ifdef ScanMPLogging}(ASource: PAnsiChar){$endif};
 {Returns the current "allocation group". Whenever a GetMem request is serviced
  in FullDebugMode, the current "allocation group" is stored in the block header.
  This may help with debugging. Note that if a block is subsequently reallocated
@@ -2219,7 +2220,7 @@ var
   nn: word;
 begin
   // TODO 1 -oPrimoz Gabrijelcic : *** TESTING, NUMANODE := 1 ***
-  Exit(0);
+//  Exit(0);
 
   // Automatically atomic on Intel
   if CurrentThreadGACount < ThreadGACount then begin
@@ -4491,7 +4492,7 @@ begin
       {Get the first free offset}
       Result := LPSmallBlockPool.FirstFreeBlock;
       {Get the new first free block}
-      LNewFirstFreeBlock := PPointer(PByte(Result) - BlockHeaderSize)^;
+      LNewFirstFreeBlock := pointer(PBlockHeader(PByte(Result) - BlockHeaderSize)^.FlagsAndSize);
 {$ifdef CheckHeapForCorruption}
       {The block should be free}
       if (NativeUInt(LNewFirstFreeBlock) and ExtractSmallFlagsMask) <> IsFreeBlockFlag then
@@ -5133,7 +5134,7 @@ begin
   if LBlockHeader^.FlagsAndSize and (IsFreeBlockFlag or IsMediumBlockFlag or IsLargeBlockFlag) = 0 then
   begin
     {Get a pointer to the block pool}
-    LPSmallBlockPool := PSmallBlockPoolHeader(LBlockHeader);
+    LPSmallBlockPool := PSmallBlockPoolHeader(LBlockHeader^.FlagsAndSize);
     {Get the block type}
     LPSmallBlockType := LPSmallBlockPool.BlockType;
 {$ifdef ClearSmallAndMediumBlocksInFreeMem}
@@ -5236,7 +5237,7 @@ begin
           Break;
         end;
         LBlockHeader := PBlockHeader(PByte(APointer) - BlockHeaderSize);
-        LPSmallBlockPool := PSmallBlockPoolHeader(LBlockHeader);
+        LPSmallBlockPool := PSmallBlockPoolHeader(LBlockHeader^.FlagsAndSize);
 {$endif}
 {$ifndef FullDebugMode}
       end;
@@ -5276,7 +5277,8 @@ end;
 {Replacement for SysReallocMem}
 function FastReallocMem({$ifdef fpc}var {$endif}APointer: Pointer; ANewSize: {$ifdef XE2AndUp}NativeInt{$else}{$ifdef fpc}NativeUInt{$else}Integer{$endif}{$endif}): Pointer;
 var
-  LBlockHeader, LNextBlockSizeAndFlags, LNewAllocSize, LBlockFlags,
+  LBlockHeader: PBlockHeader;
+  LNextBlockSizeAndFlags, LNewAllocSize, LBlockFlags,
     LOldAvailableSize, LNextBlockSize, LNewAvailableSize, LMinimumUpsize,
     LSecondSplitSize, LNewBlockSize: NativeUInt;
   LPSmallBlockType: PSmallBlockType;
@@ -5413,19 +5415,17 @@ begin
   try
 {$endif}
   {Get the block header: Is it actually a small block?}
-  with PBlockHeader(PByte(APointer) - BlockHeaderSize)^ do begin
-    LBlockHeader := FlagsAndSize;
-    LNumaNode := NumaNode;
-  end;
+  LBlockHeader := PBlockHeader(PByte(APointer) - BlockHeaderSize);
+  LNumaNode := LBlockHeader^.NumaNode;
 // TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
 if not (LNumaNode in [0,1]) then
   System.Error(reInvalidPtr);
   {Is it a small block that is in use?}
-  if LBlockHeader and (IsFreeBlockFlag or IsMediumBlockFlag or IsLargeBlockFlag) = 0 then
+  if LBlockHeader^.FlagsAndSize and (IsFreeBlockFlag or IsMediumBlockFlag or IsLargeBlockFlag) = 0 then
   begin
     {-----------------------------------Small block-------------------------------------}
     {The block header is a pointer to the block pool: Get the block type}
-    LPSmallBlockType := PSmallBlockPoolHeader(LBlockHeader).BlockType;
+    LPSmallBlockType := PSmallBlockPoolHeader(LBlockHeader^.FlagsAndSize).BlockType;
     {Get the available size inside blocks of this type.}
     LOldAvailableSize := LPSmallBlockType.BlockSize - BlockHeaderSize;
     {Is it an upsize or a downsize?}
@@ -5496,11 +5496,11 @@ if not (LNumaNode in [0,1]) then
   else
   begin
     {Is this a medium block or a large block?}
-    if LBlockHeader and (IsFreeBlockFlag or IsLargeBlockFlag) = 0 then
+    if LBlockHeader^.FlagsAndSize and (IsFreeBlockFlag or IsLargeBlockFlag) = 0 then
     begin
       {-------------------------------Medium block--------------------------------------}
       {What is the available size in the block being reallocated?}
-      LOldAvailableSize := (LBlockHeader and DropMediumAndLargeFlagsMask);
+      LOldAvailableSize := (LBlockHeader^.FlagsAndSize and DropMediumAndLargeFlagsMask);
       {Get a pointer to the next block}
       LPNextBlock := PNativeUInt(PByte(APointer) + LOldAvailableSize);
       {Subtract the block header size from the old available size}
@@ -5640,7 +5640,7 @@ if not (LNumaNode in [0,1]) then
     else
     begin
       {Is this a valid large block?}
-      if LBlockHeader and (IsFreeBlockFlag or IsMediumBlockFlag) = 0 then
+      if LBlockHeader^.FlagsAndSize and (IsFreeBlockFlag or IsMediumBlockFlag) = 0 then
       begin
         {-----------------------Large block------------------------------}
         Result := ReallocateLargeBlock(APointer, ANewSize);
@@ -6800,7 +6800,7 @@ var
 begin
   {Scan the entire memory pool first?}
   if FullDebugModeScanMemoryPoolBeforeEveryOperation then
-    ScanMemoryPoolForCorruptions;
+    ScanMemoryPoolForCorruptions{$ifdef ScanMPLogging}('DebugGetMem'){$endif};
   {Enter the memory manager: block scans may not be performed now}
   StartChangingFullDebugModeBlock;
   try
@@ -6941,7 +6941,7 @@ var
 begin
   {Scan the entire memory pool first?}
   if FullDebugModeScanMemoryPoolBeforeEveryOperation then
-    ScanMemoryPoolForCorruptions;
+    ScanMemoryPoolForCorruptions{$ifdef ScanMPLogging}('DebugFreeMem'){$endif};
   {Get a pointer to the start of the actual block}
   LActualBlock := PFullDebugBlockHeader(PByte(APointer)
     - SizeOf(TFullDebugBlockHeader));
@@ -7010,7 +7010,7 @@ var
 begin
   {Scan the entire memory pool first?}
   if FullDebugModeScanMemoryPoolBeforeEveryOperation then
-    ScanMemoryPoolForCorruptions;
+    ScanMemoryPoolForCorruptions{$ifdef ScanMPLogging}('DebugReallocMem'){$endif};
   {Get a pointer to the start of the actual block}
   LActualBlock := PFullDebugBlockHeader(PByte(APointer)
     - SizeOf(TFullDebugBlockHeader));
@@ -7171,7 +7171,8 @@ end;
 {Subroutine for LogAllocatedBlocksToFile and ScanMemoryPoolForCorruptions:
  Scans the memory pool for corruptions and optionally logs allocated blocks
  in the allocation group range.}
-procedure InternalScanMemoryPool(AFirstAllocationGroupToLog, ALastAllocationGroupToLog: Cardinal);
+procedure InternalScanMemoryPool(AFirstAllocationGroupToLog, ALastAllocationGroupToLog: Cardinal
+  {$ifdef ScanMPLogging}; ASource: PAnsiChar{$endif});
 var
   LPLargeBlock: PLargeBlockHeader;
   LPMediumBlock: Pointer;
@@ -7195,6 +7196,12 @@ begin
     LMsgPtr := NativeUIntToStrBuf(ScanNumber, LMsgPtr);
     AppendStringToBuffer(#0, LMsgPtr, 1);
     OutputDebugStringA(LMsg);
+    if assigned(ASource) then begin
+      LMsgPtr := AppendStringToBuffer('Source: ', LMsg, 8);
+      LMsgPtr := AppendStringToBuffer(ASource, LMsgPtr, StrLen(ASource));
+      AppendStringToBuffer(#0, LMsgPtr, 1);
+      OutputDebugStringA(LMsg);
+    end;
     {$endif}
     for LNumaNode := 0 to CMaxNumaNodes - 1 do begin
       {Step through all the medium block pools}
@@ -7306,15 +7313,15 @@ begin
     ALastAllocationGroupToLog := $ffffffff;
   end;
   {Scan the memory pool, logging allocated blocks in the requested range.}
-  InternalScanMemoryPool(AFirstAllocationGroupToLog, ALastAllocationGroupToLog);
+  InternalScanMemoryPool(AFirstAllocationGroupToLog, ALastAllocationGroupToLog {$ifdef ScanMPLogging}, nil{$endif});
 end;
 
 {Scans the memory pool for any corruptions. If a corruption is encountered an "Out of Memory" exception is
  raised.}
-procedure ScanMemoryPoolForCorruptions;
+procedure ScanMemoryPoolForCorruptions{$ifdef ScanMPLogging}(ASource: PAnsiChar){$endif};
 begin
   {Scan the memory pool for corruptions, but don't log any allocated blocks}
-  InternalScanMemoryPool($ffffffff, 0);
+  InternalScanMemoryPool($ffffffff, 0 {$ifdef ScanMPLogging}, ASource{$endif});
 end;
 
 {-----------------------Invalid Virtual Method Calls-------------------------}
