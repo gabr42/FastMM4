@@ -1129,6 +1129,8 @@ interface
 {$ifdef LogLockContention}{$define _StackTracer}{$define _EventLog}{$endif}
 {$ifdef UseReleaseStack}{$ifdef DebugReleaseStack}{$define _EventLog}{$endif}{$endif}
 
+{$undef UseReleaseStack} // *** TESTING ***
+
 {-------------------------Public constants-----------------------------}
 const
   {The current version of FastMM}
@@ -4417,6 +4419,9 @@ end;
 
 {Replacement for SysGetMem}
 
+var
+CurrentAllocationNumber: integer = 0; // *** TESTING ***
+
 function FastGetMem(ASize: {$ifdef XE2AndUp}NativeInt{$else}{$ifdef fpc}NativeUInt{$else}Integer{$endif}{$endif}
   {$ifdef FullDebugMode}{$ifdef LogLockContention}; var ACollector: PStaticCollector{$endif}{$endif}): Pointer;
 var
@@ -4442,6 +4447,8 @@ var
 {$endif}
   LNumaNode: integer;
 begin
+  Inc(CurrentAllocationNumber); // *** TESTING ***
+
 {$ifdef LogLockContention}
   ACollector := nil;
 {$endif}
@@ -4503,6 +4510,12 @@ begin
       Result := LPSmallBlockPool.FirstFreeBlock;
       {Get the new first free block}
       LNewFirstFreeBlock := pointer(PBlockHeader(PByte(Result) - BlockHeaderSize)^.FlagsAndSize);
+
+// TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
+if not (PBlockHeader(PByte(Result) - BlockHeaderSize)^.NumaNode in [0,1]) then
+  System.Error(reInvalidPtr);
+
+
 {$ifdef CheckHeapForCorruption}
       {The block should be free}
       if (NativeUInt(LNewFirstFreeBlock) and ExtractSmallFlagsMask) <> IsFreeBlockFlag then
@@ -4517,6 +4530,12 @@ begin
       Inc(LPSmallBlockPool.BlocksInUse);
       {Set the new first free block}
       LPSmallBlockPool.FirstFreeBlock := LNewFirstFreeBlock;
+
+// TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
+if LPSmallBlockPool.FirstFreeBlock <> nil then
+if not (PBlockHeader(PByte(LPSmallBlockPool.FirstFreeBlock) - BlockHeaderSize)^.NumaNode in [0,1]) then
+  System.Error(reInvalidPtr);
+
       {Is the pool now full?}
       if LNewFirstFreeBlock = nil then
       begin
@@ -4692,7 +4711,10 @@ begin
     {Unlock the block type}
     LPSmallBlockType.BlockTypeLocked := False;
     {Set the block header}
-    PBlockHeader(PByte(Result) - BlockHeaderSize)^.FlagsAndSize := UIntPtr(LPSmallBlockPool);
+    with PBlockHeader(PByte(Result) - BlockHeaderSize)^ do begin
+      NumaNode := LNumaNode;
+      FlagsAndSize := UIntPtr(LPSmallBlockPool);
+    end;
   end
   else
   begin
@@ -4881,6 +4903,11 @@ begin
   end;
 {$endif}
 {$endif}
+
+// TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
+if not (PBlockHeader(PByte(Result) - BlockHeaderSize)^.NumaNode in [0,1]) then
+  System.Error(reInvalidPtr);
+
 end;
 
 {Frees a medium block, returning 0 on success, -1 otherwise}
@@ -5138,6 +5165,10 @@ begin
     Exit;
   end;
   {$endif}
+
+  if (APointer = pointer($2BCB9D0)) or (APointer = pointer($2D1B9D0)) then
+    Sleep(0);
+
   {Get the small block header: Is it actually a small block?}
   LBlockHeader := PBlockHeader(PByte(APointer) - BlockHeaderSize);
   {Is it a small block that is in use?}
@@ -5206,6 +5237,11 @@ begin
       PBlockHeader(PByte(APointer) - BlockHeaderSize)^.FlagsAndSize := UIntPtr(LOldFirstFreeBlock) or IsFreeBlockFlag;
       {Store this as the new first free block}
       LPSmallBlockPool.FirstFreeBlock := APointer;
+
+// TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
+if not (PBlockHeader(PByte(LPSmallBlockPool.FirstFreeBlock) - BlockHeaderSize)^.NumaNode in [0,1]) then
+  System.Error(reInvalidPtr);
+
       {Decrement the number of allocated blocks}
       Dec(LPSmallBlockPool.BlocksInUse);
       {Small block pools are never freed in full debug mode. This increases the
@@ -5427,9 +5463,11 @@ begin
   {Get the block header: Is it actually a small block?}
   LBlockHeader := PBlockHeader(PByte(APointer) - BlockHeaderSize);
   LNumaNode := LBlockHeader^.NumaNode;
+
 // TODO 1 -oPrimoz Gabrijelcic : *** TESTING ***
 if not (LNumaNode in [0,1]) then
   System.Error(reInvalidPtr);
+
   {Is it a small block that is in use?}
   if LBlockHeader^.FlagsAndSize and (IsFreeBlockFlag or IsMediumBlockFlag or IsLargeBlockFlag) = 0 then
   begin
@@ -10327,7 +10365,7 @@ initialization
   {$endif}
 
   RunInitializationCode;
-  FullDebugModeScanMemoryPoolBeforeEveryOperation := true;
+//  FullDebugModeScanMemoryPoolBeforeEveryOperation := true;
 
 finalization
 {$ifndef PatchBCBTerminate}
