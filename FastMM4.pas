@@ -4801,6 +4801,15 @@ if not (PBlockHeader(PByte(LPSmallBlockPool.FirstFreeBlock) - BlockHeaderSize)^.
 {$endif}
           {Done}
           MediumBlocksLocked[LNumaNode] := False;
+{$ifdef LogLockContention}
+{$ifndef FullDebugMode}
+          if Assigned(ACollector) then
+          begin
+            GetStackTrace(@LStackTrace, StackTraceDepth, 1);
+            ACollector.Add(@LStackTrace[0], StackTraceDepth);
+          end;
+{$endif}
+{$endif}
           Exit;
 {$ifndef FullDebugMode}
         end;
